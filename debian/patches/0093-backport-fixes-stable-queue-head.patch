@@ -1,0 +1,3579 @@
+Index: pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478/configure.ac
+===================================================================
+--- pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478.orig/configure.ac	2010-01-17 18:54:19.000000000 -0500
++++ pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478/configure.ac	2010-09-18 08:44:15.000000000 -0400
+@@ -516,7 +516,7 @@
+         [x11=auto])
+ 
+ if test "x${x11}" != xno ; then
+-    PKG_CHECK_MODULES(X11, [ x11 ice sm xtst ],
++    PKG_CHECK_MODULES(X11, [ x11-xcb ice sm xtst xcb-atom ],
+         HAVE_X11=1,
+         [
+             HAVE_X11=0
+Index: pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478/src/Makefile.am
+===================================================================
+--- pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478.orig/src/Makefile.am	2010-01-17 18:54:19.000000000 -0500
++++ pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478/src/Makefile.am	2010-09-18 08:44:25.000000000 -0400
+@@ -110,7 +110,8 @@
+ ALSA_PROFILES = \
+ 		modules/alsa/mixer/profile-sets/default.conf \
+ 		modules/alsa/mixer/profile-sets/native-instruments-audio4dj.conf \
+-		modules/alsa/mixer/profile-sets/native-instruments-audio8dj.conf
++		modules/alsa/mixer/profile-sets/native-instruments-audio8dj.conf \
++		modules/alsa/mixer/profile-sets/native-instruments-traktorkontrol-s4.conf
+ 
+ ALSA_PATHS = \
+ 		modules/alsa/mixer/paths/analog-input-aux.conf \
+Index: pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478/src/modules/alsa/alsa-mixer.c
+===================================================================
+--- pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478.orig/src/modules/alsa/alsa-mixer.c	2010-01-17 18:54:19.000000000 -0500
++++ pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478/src/modules/alsa/alsa-mixer.c	2010-09-18 08:44:02.000000000 -0400
+@@ -1783,8 +1783,7 @@
+         { "analog-output-headphones",   N_("Analog Headphones") },
+         { "analog-output-lfe-on-mono",  N_("Analog Output (LFE)") },
+         { "analog-output-mono",         N_("Analog Mono Output") },
+-        { "analog-output-headphones-2", N_("Analog Headphones 2") },
+-        { "analog-output-speaker",      N_("Analog Speaker") }
++        { "analog-output-speaker",      N_("Analog Speakers") }
+     };
+ 
+     pa_alsa_element *e;
+Index: pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478/src/modules/alsa/alsa-sink.c
+===================================================================
+--- pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478.orig/src/modules/alsa/alsa-sink.c	2010-01-17 18:54:19.000000000 -0500
++++ pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478/src/modules/alsa/alsa-sink.c	2010-09-18 08:44:02.000000000 -0400
+@@ -78,11 +78,17 @@
+ #define TSCHED_MIN_SLEEP_USEC (10*PA_USEC_PER_MSEC)                /* 10ms  -- Sleep at least 10ms on each iteration */
+ #define TSCHED_MIN_WAKEUP_USEC (4*PA_USEC_PER_MSEC)                /* 4ms   -- Wakeup at least this long before the buffer runs empty*/
+ 
++#define SMOOTHER_WINDOW_USEC  (10*PA_USEC_PER_SEC)                 /* 10s   -- smoother windows size */
++#define SMOOTHER_ADJUST_USEC  (1*PA_USEC_PER_SEC)                  /* 1s    -- smoother adjust time */
++
+ #define SMOOTHER_MIN_INTERVAL (2*PA_USEC_PER_MSEC)                 /* 2ms   -- min smoother update interval */
+-#define SMOOTHER_MAX_INTERVAL (200*PA_USEC_PER_MSEC)               /* 200ms -- max smoother update inteval */
++#define SMOOTHER_MAX_INTERVAL (200*PA_USEC_PER_MSEC)               /* 200ms -- max smoother update interval */
+ 
+ #define VOLUME_ACCURACY (PA_VOLUME_NORM/100)  /* don't require volume adjustments to be perfectly correct. don't necessarily extend granularity in software unless the differences get greater than this level */
+ 
++#define DEFAULT_REWIND_SAFEGUARD_BYTES (256U) /* 1.33ms @48kHz, we'll never rewind less than this */
++#define DEFAULT_REWIND_SAFEGUARD_USEC (1330) /* 1.33ms, depending on channels/rate/sample we may rewind more than 256 above */
++
+ struct userdata {
+     pa_core *core;
+     pa_module *module;
+@@ -112,7 +118,8 @@
+         watermark_inc_step,
+         watermark_dec_step,
+         watermark_inc_threshold,
+-        watermark_dec_threshold;
++        watermark_dec_threshold,
++        rewind_safeguard;
+ 
+     pa_usec_t watermark_dec_not_before;
+ 
+@@ -607,6 +614,9 @@
+ 
+             if (PA_UNLIKELY((sframes = snd_pcm_mmap_commit(u->pcm_handle, offset, frames)) < 0)) {
+ 
++                if (!after_avail && (int) sframes == -EAGAIN)
++                    break;
++
+                 if ((r = try_recover(u, "snd_pcm_mmap_commit", (int) sframes)) == 0)
+                     continue;
+ 
+@@ -629,11 +639,14 @@
+         }
+     }
+ 
+-    *sleep_usec = pa_bytes_to_usec(left_to_play, &u->sink->sample_spec);
++    if (u->use_tsched) {
++        *sleep_usec = pa_bytes_to_usec(left_to_play, &u->sink->sample_spec);
+ 
+-    if (*sleep_usec > process_usec)
+-        *sleep_usec -= process_usec;
+-    else
++        if (*sleep_usec > process_usec)
++            *sleep_usec -= process_usec;
++        else
++            *sleep_usec = 0;
++    } else
+         *sleep_usec = 0;
+ 
+     return work_done ? 1 : 0;
+@@ -766,11 +779,14 @@
+         }
+     }
+ 
+-    *sleep_usec = pa_bytes_to_usec(left_to_play, &u->sink->sample_spec);
++    if (u->use_tsched) {
++        *sleep_usec = pa_bytes_to_usec(left_to_play, &u->sink->sample_spec);
+ 
+-    if (*sleep_usec > process_usec)
+-        *sleep_usec -= process_usec;
+-    else
++        if (*sleep_usec > process_usec)
++            *sleep_usec -= process_usec;
++        else
++            *sleep_usec = 0;
++    } else
+         *sleep_usec = 0;
+ 
+     return work_done ? 1 : 0;
+@@ -790,7 +806,7 @@
+ 
+     /* Let's update the time smoother */
+ 
+-    if (PA_UNLIKELY((err = pa_alsa_safe_delay(u->pcm_handle, &delay, u->hwbuf_size, &u->sink->sample_spec)) < 0)) {
++    if (PA_UNLIKELY((err = pa_alsa_safe_delay(u->pcm_handle, &delay, u->hwbuf_size, &u->sink->sample_spec, FALSE)) < 0)) {
+         pa_log_warn("Failed to query DSP status data: %s", pa_alsa_strerror(err));
+         return;
+     }
+@@ -876,6 +892,14 @@
+         u->alsa_rtpoll_item = NULL;
+     }
+ 
++    /* We reset max_rewind/max_request here to make sure that while we
++     * are suspended the old max_request/max_rewind values set before
++     * the suspend can influence the per-stream buffer of newly
++     * created streams, without their requirements having any
++     * influence on them. */
++    pa_sink_set_max_rewind_within_thread(u->sink, 0);
++    pa_sink_set_max_request_within_thread(u->sink, 0);
++
+     pa_log_info("Device suspended...");
+ 
+     return 0;
+@@ -933,6 +957,12 @@
+     }
+ 
+     pa_sink_set_max_request_within_thread(u->sink, u->hwbuf_size - u->hwbuf_unused);
++     if (pa_alsa_pcm_is_hw(u->pcm_handle))
++         pa_sink_set_max_rewind_within_thread(u->sink, u->hwbuf_size);
++    else {
++        pa_log_info("Disabling rewind_within_thread for device %s", u->device_name);
++        pa_sink_set_max_rewind_within_thread(u->sink, 0);
++    }
+ 
+     return 0;
+ }
+@@ -1258,6 +1288,9 @@
+     struct userdata *u = s->userdata;
+     size_t before;
+     pa_assert(u);
++    pa_assert(u->use_tsched); /* only when timer scheduling is used
++                               * we can dynamically adjust the
++                               * latency */
+ 
+     if (!u->pcm_handle)
+         return;
+@@ -1292,7 +1325,10 @@
+         return -1;
+     }
+ 
+-    unused_nbytes = u->tsched_watermark + (size_t) unused * u->frame_size;
++    unused_nbytes = (size_t) unused * u->frame_size;
++
++    /* make sure rewind doesn't go too far, can cause issues with DMAs */
++    unused_nbytes += u->rewind_safeguard;
+ 
+     if (u->hwbuf_size > unused_nbytes)
+         limit_nbytes = u->hwbuf_size - unused_nbytes;
+@@ -1384,6 +1420,8 @@
+                     snd_pcm_start(u->pcm_handle);
+ 
+                     pa_smoother_resume(u->smoother, pa_rtclock_now(), TRUE);
++
++                    u->first = FALSE;
+                 }
+ 
+                 update_smoother(u);
+@@ -1421,7 +1459,6 @@
+                 pa_rtpoll_set_timer_relative(u->rtpoll, PA_MIN(sleep_usec, cusec));
+             }
+ 
+-            u->first = FALSE;
+             u->after_rewind = FALSE;
+ 
+         } else if (u->use_tsched)
+@@ -1645,7 +1682,7 @@
+     const char *dev_id = NULL;
+     pa_sample_spec ss, requested_ss;
+     pa_channel_map map;
+-    uint32_t nfrags, frag_size, buffer_size, tsched_size, tsched_watermark;
++    uint32_t nfrags, frag_size, buffer_size, tsched_size, tsched_watermark, rewind_safeguard;
+     snd_pcm_uframes_t period_frames, buffer_frames, tsched_frames;
+     size_t frame_size;
+     pa_bool_t use_mmap = TRUE, b, use_tsched = TRUE, d, ignore_dB = FALSE;
+@@ -1701,6 +1738,12 @@
+         goto fail;
+     }
+ 
++    rewind_safeguard = PA_MAX(DEFAULT_REWIND_SAFEGUARD_BYTES, pa_usec_to_bytes(DEFAULT_REWIND_SAFEGUARD_USEC, &ss));
++    if (pa_modargs_get_value_u32(ma, "rewind_safeguard", &rewind_safeguard) < 0) {
++        pa_log("Failed to parse rewind_safeguard argument");
++        goto fail;
++    }
++
+     use_tsched = pa_alsa_may_tsched(use_tsched);
+ 
+     u = pa_xnew0(struct userdata, 1);
+@@ -1709,12 +1752,13 @@
+     u->use_mmap = use_mmap;
+     u->use_tsched = use_tsched;
+     u->first = TRUE;
++    u->rewind_safeguard = rewind_safeguard;
+     u->rtpoll = pa_rtpoll_new();
+     pa_thread_mq_init(&u->thread_mq, m->core->mainloop, u->rtpoll);
+ 
+     u->smoother = pa_smoother_new(
+-            DEFAULT_TSCHED_BUFFER_USEC*2,
+-            DEFAULT_TSCHED_BUFFER_USEC*2,
++            SMOOTHER_ADJUST_USEC,
++            SMOOTHER_WINDOW_USEC,
+             TRUE,
+             TRUE,
+             5,
+@@ -1853,7 +1897,8 @@
+     }
+ 
+     u->sink->parent.process_msg = sink_process_msg;
+-    u->sink->update_requested_latency = sink_update_requested_latency_cb;
++    if (u->use_tsched)
++        u->sink->update_requested_latency = sink_update_requested_latency_cb;
+     u->sink->set_state = sink_set_state_cb;
+     u->sink->set_port = sink_set_port_cb;
+     u->sink->userdata = u;
+@@ -1874,7 +1919,12 @@
+                 (double) pa_bytes_to_usec(u->hwbuf_size, &ss) / PA_USEC_PER_MSEC);
+ 
+     pa_sink_set_max_request(u->sink, u->hwbuf_size);
+-    pa_sink_set_max_rewind(u->sink, u->hwbuf_size);
++    if (pa_alsa_pcm_is_hw(u->pcm_handle))
++        pa_sink_set_max_rewind(u->sink, u->hwbuf_size);
++    else {
++        pa_log_info("Disabling rewind for device %s", u->device_name);
++        pa_sink_set_max_rewind(u->sink, 0);
++    }
+ 
+     if (u->use_tsched) {
+         u->tsched_watermark = pa_usec_to_bytes_round_up(pa_bytes_to_usec_round_up(tsched_watermark, &requested_ss), &u->sink->sample_spec);
+@@ -1897,7 +1947,6 @@
+     } else
+         pa_sink_set_fixed_latency(u->sink, pa_bytes_to_usec(u->hwbuf_size, &ss));
+ 
+-
+     reserve_update(u);
+ 
+     if (update_sw_params(u) < 0)
+@@ -1908,7 +1957,7 @@
+ 
+     pa_alsa_dump(PA_LOG_DEBUG, u->pcm_handle);
+ 
+-    if (!(u->thread = pa_thread_new(thread_func, u))) {
++    if (!(u->thread = pa_thread_new("alsa-sink", thread_func, u))) {
+         pa_log("Failed to create thread.");
+         goto fail;
+     }
+Index: pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478/src/modules/alsa/alsa-source.c
+===================================================================
+--- pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478.orig/src/modules/alsa/alsa-source.c	2010-01-17 18:54:19.000000000 -0500
++++ pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478/src/modules/alsa/alsa-source.c	2010-09-18 08:44:02.000000000 -0400
+@@ -73,6 +73,9 @@
+ #define TSCHED_MIN_SLEEP_USEC (10*PA_USEC_PER_MSEC)                /* 10ms */
+ #define TSCHED_MIN_WAKEUP_USEC (4*PA_USEC_PER_MSEC)                /* 4ms */
+ 
++#define SMOOTHER_WINDOW_USEC  (10*PA_USEC_PER_SEC)                 /* 10s */
++#define SMOOTHER_ADJUST_USEC  (1*PA_USEC_PER_SEC)                  /* 1s */
++
+ #define SMOOTHER_MIN_INTERVAL (2*PA_USEC_PER_MSEC)                 /* 2ms */
+ #define SMOOTHER_MAX_INTERVAL (200*PA_USEC_PER_MSEC)               /* 200ms */
+ 
+@@ -116,6 +119,8 @@
+ 
+     pa_bool_t use_mmap:1, use_tsched:1;
+ 
++    pa_bool_t first;
++
+     pa_rtpoll_item *alsa_rtpoll_item;
+ 
+     snd_mixer_selem_channel_id_t mixer_map[SND_MIXER_SCHN_LAST];
+@@ -397,7 +402,7 @@
+         return -1;
+     }
+ 
+-    snd_pcm_start(u->pcm_handle);
++    u->first = TRUE;
+     return 0;
+ }
+ 
+@@ -603,12 +608,14 @@
+         }
+     }
+ 
+-    *sleep_usec = pa_bytes_to_usec(left_to_record, &u->source->sample_spec);
++    if (u->use_tsched) {
++        *sleep_usec = pa_bytes_to_usec(left_to_record, &u->source->sample_spec);
+ 
+-    if (*sleep_usec > process_usec)
+-        *sleep_usec -= process_usec;
+-    else
+-        *sleep_usec = 0;
++        if (*sleep_usec > process_usec)
++            *sleep_usec -= process_usec;
++        else
++            *sleep_usec = 0;
++    }
+ 
+     return work_done ? 1 : 0;
+ }
+@@ -730,12 +737,14 @@
+         }
+     }
+ 
+-    *sleep_usec = pa_bytes_to_usec(left_to_record, &u->source->sample_spec);
++    if (u->use_tsched) {
++        *sleep_usec = pa_bytes_to_usec(left_to_record, &u->source->sample_spec);
+ 
+-    if (*sleep_usec > process_usec)
+-        *sleep_usec -= process_usec;
+-    else
+-        *sleep_usec = 0;
++        if (*sleep_usec > process_usec)
++            *sleep_usec -= process_usec;
++        else
++            *sleep_usec = 0;
++    }
+ 
+     return work_done ? 1 : 0;
+ }
+@@ -754,7 +763,7 @@
+ 
+     /* Let's update the time smoother */
+ 
+-    if (PA_UNLIKELY((err = pa_alsa_safe_delay(u->pcm_handle, &delay, u->hwbuf_size, &u->source->sample_spec)) < 0)) {
++    if (PA_UNLIKELY((err = pa_alsa_safe_delay(u->pcm_handle, &delay, u->hwbuf_size, &u->source->sample_spec, TRUE)) < 0)) {
+         pa_log_warn("Failed to get delay: %s", pa_alsa_strerror(err));
+         return;
+     }
+@@ -942,13 +951,13 @@
+ 
+     /* FIXME: We need to reload the volume somehow */
+ 
+-    snd_pcm_start(u->pcm_handle);
+-
+     u->read_count = 0;
+     pa_smoother_reset(u->smoother, pa_rtclock_now(), TRUE);
+     u->smoother_interval = SMOOTHER_MIN_INTERVAL;
+     u->last_smoother_update = 0;
+ 
++    u->first = TRUE;
++
+     pa_log_info("Resumed successfully...");
+ 
+     return 0;
+@@ -999,8 +1008,6 @@
+                     if (u->source->thread_info.state == PA_SOURCE_INIT) {
+                         if (build_pollfd(u) < 0)
+                             return -PA_ERR_IO;
+-
+-                        snd_pcm_start(u->pcm_handle);
+                     }
+ 
+                     if (u->source->thread_info.state == PA_SOURCE_SUSPENDED) {
+@@ -1205,6 +1212,7 @@
+ static void source_update_requested_latency_cb(pa_source *s) {
+     struct userdata *u = s->userdata;
+     pa_assert(u);
++    pa_assert(u->use_tsched);
+ 
+     if (!u->pcm_handle)
+         return;
+@@ -1238,6 +1246,15 @@
+             pa_usec_t sleep_usec = 0;
+             pa_bool_t on_timeout = pa_rtpoll_timer_elapsed(u->rtpoll);
+ 
++            if (u->first) {
++                pa_log_info("Starting capture.");
++                snd_pcm_start(u->pcm_handle);
++
++                pa_smoother_resume(u->smoother, pa_rtclock_now(), TRUE);
++
++                u->first = FALSE;
++            }
++
+             if (u->use_mmap)
+                 work_done = mmap_read(u, &sleep_usec, revents & POLLIN, on_timeout);
+             else
+@@ -1297,7 +1314,7 @@
+                 if (pa_alsa_recover_from_poll(u->pcm_handle, revents) < 0)
+                     goto fail;
+ 
+-                snd_pcm_start(u->pcm_handle);
++                u->first = TRUE;
+             } else if (revents && u->use_tsched && pa_log_ratelimit())
+                 pa_log_debug("Wakeup from ALSA!");
+ 
+@@ -1551,17 +1568,18 @@
+     u->module = m;
+     u->use_mmap = use_mmap;
+     u->use_tsched = use_tsched;
++    u->first = TRUE;
+     u->rtpoll = pa_rtpoll_new();
+     pa_thread_mq_init(&u->thread_mq, m->core->mainloop, u->rtpoll);
+ 
+     u->smoother = pa_smoother_new(
+-            DEFAULT_TSCHED_WATERMARK_USEC*2,
+-            DEFAULT_TSCHED_WATERMARK_USEC*2,
++            SMOOTHER_ADJUST_USEC,
++            SMOOTHER_WINDOW_USEC,
+             TRUE,
+             TRUE,
+             5,
+             pa_rtclock_now(),
+-            FALSE);
++            TRUE);
+     u->smoother_interval = SMOOTHER_MIN_INTERVAL;
+ 
+     dev_id = pa_modargs_get_value(
+@@ -1693,7 +1711,8 @@
+     }
+ 
+     u->source->parent.process_msg = source_process_msg;
+-    u->source->update_requested_latency = source_update_requested_latency_cb;
++    if (u->use_tsched)
++        u->source->update_requested_latency = source_update_requested_latency_cb;
+     u->source->set_state = source_set_state_cb;
+     u->source->set_port = source_set_port_cb;
+     u->source->userdata = u;
+@@ -1744,7 +1763,7 @@
+ 
+     pa_alsa_dump(PA_LOG_DEBUG, u->pcm_handle);
+ 
+-    if (!(u->thread = pa_thread_new(thread_func, u))) {
++    if (!(u->thread = pa_thread_new("alsa-source", thread_func, u))) {
+         pa_log("Failed to create thread.");
+         goto fail;
+     }
+Index: pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478/src/modules/alsa/alsa-util.c
+===================================================================
+--- pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478.orig/src/modules/alsa/alsa-util.c	2009-11-20 16:58:44.000000000 -0500
++++ pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478/src/modules/alsa/alsa-util.c	2010-09-18 08:44:02.000000000 -0400
+@@ -874,12 +874,12 @@
+     pa_proplist_setf(p, "alsa.card", "%i", card);
+ 
+     if (snd_card_get_name(card, &cn) >= 0) {
+-        pa_proplist_sets(p, "alsa.card_name", cn);
++        pa_proplist_sets(p, "alsa.card_name", pa_strip(cn));
+         free(cn);
+     }
+ 
+     if (snd_card_get_longname(card, &lcn) >= 0) {
+-        pa_proplist_sets(p, "alsa.long_card_name", lcn);
++        pa_proplist_sets(p, "alsa.long_card_name", pa_strip(lcn));
+         free(lcn);
+     }
+ 
+@@ -937,8 +937,11 @@
+         if (alsa_subclass_table[subclass])
+             pa_proplist_sets(p, "alsa.subclass", alsa_subclass_table[subclass]);
+ 
+-    if ((n = snd_pcm_info_get_name(pcm_info)))
+-        pa_proplist_sets(p, "alsa.name", n);
++    if ((n = snd_pcm_info_get_name(pcm_info))) {
++        char *t = pa_xstrdup(n);
++        pa_proplist_sets(p, "alsa.name", pa_strip(t));
++        pa_xfree(t);
++    }
+ 
+     if ((id = snd_pcm_info_get_id(pcm_info)))
+         pa_proplist_sets(p, "alsa.id", id);
+@@ -1122,10 +1125,11 @@
+     return n;
+ }
+ 
+-int pa_alsa_safe_delay(snd_pcm_t *pcm, snd_pcm_sframes_t *delay, size_t hwbuf_size, const pa_sample_spec *ss) {
++int pa_alsa_safe_delay(snd_pcm_t *pcm, snd_pcm_sframes_t *delay, size_t hwbuf_size, const pa_sample_spec *ss, pa_bool_t capture) {
+     ssize_t k;
+     size_t abs_k;
+     int r;
++    snd_pcm_sframes_t avail = 0;
+ 
+     pa_assert(pcm);
+     pa_assert(delay);
+@@ -1133,9 +1137,10 @@
+     pa_assert(ss);
+ 
+     /* Some ALSA driver expose weird bugs, let's inform the user about
+-     * what is going on */
++     * what is going on. We're going to get both the avail and delay values so
++     * that we can compare and check them for capture */
+ 
+-    if ((r = snd_pcm_delay(pcm, delay)) < 0)
++    if ((r = snd_pcm_avail_delay(pcm, &avail, delay)) < 0)
+         return r;
+ 
+     k = (ssize_t) *delay * (ssize_t) pa_frame_size(ss);
+@@ -1164,6 +1169,44 @@
+             *delay = (snd_pcm_sframes_t) (hwbuf_size / pa_frame_size(ss));
+     }
+ 
++    if (capture) {
++        abs_k = (size_t) avail * pa_frame_size(ss);
++
++        if (abs_k >= hwbuf_size * 5 ||
++            abs_k >= pa_bytes_per_second(ss)*10) {
++
++            PA_ONCE_BEGIN {
++                char *dn = pa_alsa_get_driver_name_by_pcm(pcm);
++                pa_log(_("snd_pcm_avail() returned a value that is exceptionally large: %lu bytes (%lu ms).\n"
++                         "Most likely this is a bug in the ALSA driver '%s'. Please report this issue to the ALSA developers."),
++                       (unsigned long) k,
++                       (unsigned long) (pa_bytes_to_usec(k, ss) / PA_USEC_PER_MSEC),
++                       pa_strnull(dn));
++                pa_xfree(dn);
++                pa_alsa_dump(PA_LOG_ERROR, pcm);
++            } PA_ONCE_END;
++
++            /* Mhmm, let's try not to fail completely */
++            avail = (snd_pcm_sframes_t) (hwbuf_size / pa_frame_size(ss));
++        }
++
++        if (*delay < avail) {
++            PA_ONCE_BEGIN {
++                char *dn = pa_alsa_get_driver_name_by_pcm(pcm);
++                pa_log(_("snd_pcm_avail_delay() returned strange values: delay %lu is less than avail %lu.\n"
++                         "Most likely this is a bug in the ALSA driver '%s'. Please report this issue to the ALSA developers."),
++                       (unsigned long) *delay,
++                       (unsigned long) avail,
++                       pa_strnull(dn));
++                pa_xfree(dn);
++                pa_alsa_dump(PA_LOG_ERROR, pcm);
++            } PA_ONCE_END;
++
++            /* try to fixup */
++            *delay = avail;
++        }
++    }
++
+     return 0;
+ }
+ 
+@@ -1331,6 +1374,5 @@
+         return FALSE;
+     }
+ 
+-
+     return TRUE;
+ }
+Index: pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478/src/modules/alsa/alsa-util.h
+===================================================================
+--- pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478.orig/src/modules/alsa/alsa-util.h	2009-11-11 15:38:11.000000000 -0500
++++ pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478/src/modules/alsa/alsa-util.h	2010-09-18 08:44:02.000000000 -0400
+@@ -129,7 +129,7 @@
+ pa_rtpoll_item* pa_alsa_build_pollfd(snd_pcm_t *pcm, pa_rtpoll *rtpoll);
+ 
+ snd_pcm_sframes_t pa_alsa_safe_avail(snd_pcm_t *pcm, size_t hwbuf_size, const pa_sample_spec *ss);
+-int pa_alsa_safe_delay(snd_pcm_t *pcm, snd_pcm_sframes_t *delay, size_t hwbuf_size, const pa_sample_spec *ss);
++int pa_alsa_safe_delay(snd_pcm_t *pcm, snd_pcm_sframes_t *delay, size_t hwbuf_size, const pa_sample_spec *ss, pa_bool_t capture);
+ int pa_alsa_safe_mmap_begin(snd_pcm_t *pcm, const snd_pcm_channel_area_t **areas, snd_pcm_uframes_t *offset, snd_pcm_uframes_t *frames, size_t hwbuf_size, const pa_sample_spec *ss);
+ 
+ char *pa_alsa_get_driver_name(int card);
+Index: pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478/src/modules/alsa/mixer/paths/analog-input-aux.conf
+===================================================================
+--- pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478.orig/src/modules/alsa/mixer/paths/analog-input-aux.conf	2009-06-18 19:37:47.000000000 -0400
++++ pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478/src/modules/alsa/mixer/paths/analog-input-aux.conf	2010-09-18 08:44:02.000000000 -0400
+@@ -32,6 +32,10 @@
+ switch = off
+ volume = off
+ 
++[Element Internal Mic]
++switch = off
++volume = off
++
+ [Element Line]
+ switch = off
+ volume = off
+Index: pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478/src/modules/alsa/mixer/paths/analog-input.conf
+===================================================================
+--- pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478.orig/src/modules/alsa/mixer/paths/analog-input.conf	2009-06-18 19:37:47.000000000 -0400
++++ pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478/src/modules/alsa/mixer/paths/analog-input.conf	2010-09-18 08:44:02.000000000 -0400
+@@ -32,6 +32,9 @@
+ [Element Mic]
+ required-absent = any
+ 
++[Element Internal Mic]
++required-absent = any
++
+ [Element Line]
+ required-absent = any
+ 
+Index: pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478/src/modules/alsa/mixer/paths/analog-input.conf.common
+===================================================================
+--- pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478.orig/src/modules/alsa/mixer/paths/analog-input.conf.common	2010-01-17 18:54:19.000000000 -0500
++++ pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478/src/modules/alsa/mixer/paths/analog-input.conf.common	2010-09-18 08:44:21.000000000 -0400
+@@ -277,6 +277,31 @@
+ [Option Digital Input Source:Digital Mic 2]
+ name = input-microphone
+ 
++;;; 'Analog Source'
++
++[Element Analog Source]
++enumeration = select
++
++[Option Analog Source:Mic]
++name = input-microphone
++
++[Option Analog Source:Line in]
++name = input-linein
++
++[Option Analog Source:Aux]
++name = input
++
++;;; 'Shared Mic/Line in'
++
++[Element Shared Mic/Line in]
++enumeration = select
++
++[Option Shared Mic/Line in:Mic in]
++name = input-microphone
++
++[Option Shared Mic/Line in:Line in]
++name = input-linein
++
+ ;;; Various Boosts
+ 
+ [Element Capture Boost]
+Index: pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478/src/modules/alsa/mixer/paths/analog-input-fm.conf
+===================================================================
+--- pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478.orig/src/modules/alsa/mixer/paths/analog-input-fm.conf	2009-06-18 19:37:47.000000000 -0400
++++ pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478/src/modules/alsa/mixer/paths/analog-input-fm.conf	2010-09-18 08:44:02.000000000 -0400
+@@ -32,6 +32,10 @@
+ switch = off
+ volume = off
+ 
++[Element Internal Mic]
++switch = off
++volume = off
++
+ [Element Line]
+ switch = off
+ volume = off
+Index: pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478/src/modules/alsa/mixer/paths/analog-input-internal-mic.conf
+===================================================================
+--- /dev/null	1970-01-01 00:00:00.000000000 +0000
++++ pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478/src/modules/alsa/mixer/paths/analog-input-internal-mic.conf	2010-09-18 08:44:02.000000000 -0400
+@@ -0,0 +1,67 @@
++# This file is part of PulseAudio.
++#
++# PulseAudio is free software; you can redistribute it and/or modify
++# it under the terms of the GNU Lesser General Public License as
++# published by the Free Software Foundation; either version 2.1 of the
++# License, or (at your option) any later version.
++#
++# PulseAudio is distributed in the hope that it will be useful, but
++# WITHOUT ANY WARRANTY; without even the implied warranty of
++# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
++# General Public License for more details.
++#
++# You should have received a copy of the GNU Lesser General Public License
++# along with PulseAudio; if not, write to the Free Software Foundation,
++# Inc., 59 Temple Place, Suite 330, Boston, MA 02111-1307 USA.
++
++; For devices where a 'Internal Mic' element exists
++;
++; See analog-output.conf.common for an explanation on the directives
++
++[General]
++priority = 90
++name = analog-input-microphone
++
++[Element Capture]
++switch = mute
++volume = merge
++override-map.1 = all
++override-map.2 = all-left,all-right
++
++[Element Mic]
++switch = off
++volume = off
++
++[Element Internal Mic]
++required = any
++switch = mute
++volume = merge
++override-map.1 = all
++override-map.2 = all-left,all-right
++
++[Element Line]
++switch = off
++volume = off
++
++[Element Aux]
++switch = off
++volume = off
++
++[Element Video]
++switch = off
++volume = off
++
++[Element Mic/Line]
++switch = off
++volume = off
++
++[Element TV Tuner]
++switch = off
++volume = off
++
++[Element FM]
++switch = off
++volume = off
++
++.include analog-input.conf.common
++.include analog-input-mic.conf.common
+Index: pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478/src/modules/alsa/mixer/paths/analog-input-linein.conf
+===================================================================
+--- pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478.orig/src/modules/alsa/mixer/paths/analog-input-linein.conf	2009-06-18 19:37:47.000000000 -0400
++++ pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478/src/modules/alsa/mixer/paths/analog-input-linein.conf	2010-09-18 08:44:02.000000000 -0400
+@@ -31,6 +31,10 @@
+ switch = off
+ volume = off
+ 
++[Element Internal Mic]
++switch = off
++volume = off
++
+ [Element Line]
+ required = any
+ switch = mute
+Index: pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478/src/modules/alsa/mixer/paths/analog-input-mic.conf
+===================================================================
+--- pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478.orig/src/modules/alsa/mixer/paths/analog-input-mic.conf	2009-06-18 19:37:47.000000000 -0400
++++ pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478/src/modules/alsa/mixer/paths/analog-input-mic.conf	2010-09-18 08:44:02.000000000 -0400
+@@ -35,6 +35,10 @@
+ override-map.1 = all
+ override-map.2 = all-left,all-right
+ 
++[Element Internal Mic]
++switch = off
++volume = off
++
+ [Element Line]
+ switch = off
+ volume = off
+Index: pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478/src/modules/alsa/mixer/paths/analog-input-mic-line.conf
+===================================================================
+--- pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478.orig/src/modules/alsa/mixer/paths/analog-input-mic-line.conf	2009-06-18 19:37:47.000000000 -0400
++++ pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478/src/modules/alsa/mixer/paths/analog-input-mic-line.conf	2010-09-18 08:44:02.000000000 -0400
+@@ -32,6 +32,10 @@
+ switch = off
+ volume = off
+ 
++[Element Internal Mic]
++switch = off
++volume = off
++
+ [Element Line]
+ switch = off
+ volume = off
+Index: pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478/src/modules/alsa/mixer/paths/analog-input-tvtuner.conf
+===================================================================
+--- pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478.orig/src/modules/alsa/mixer/paths/analog-input-tvtuner.conf	2009-06-18 19:37:47.000000000 -0400
++++ pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478/src/modules/alsa/mixer/paths/analog-input-tvtuner.conf	2010-09-18 08:44:02.000000000 -0400
+@@ -32,6 +32,10 @@
+ switch = off
+ volume = off
+ 
++[Element Internal Mic]
++switch = off
++volume = off
++
+ [Element Line]
+ switch = off
+ volume = off
+Index: pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478/src/modules/alsa/mixer/paths/analog-input-video.conf
+===================================================================
+--- pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478.orig/src/modules/alsa/mixer/paths/analog-input-video.conf	2009-06-18 19:37:47.000000000 -0400
++++ pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478/src/modules/alsa/mixer/paths/analog-input-video.conf	2010-09-18 08:44:02.000000000 -0400
+@@ -31,6 +31,10 @@
+ switch = off
+ volume = off
+ 
++[Element Internal Mic]
++switch = off
++volume = off
++
+ [Element Line]
+ switch = off
+ volume = off
+Index: pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478/src/modules/alsa/mixer/paths/analog-output.conf
+===================================================================
+--- pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478.orig/src/modules/alsa/mixer/paths/analog-output.conf	2010-09-18 08:44:02.000000000 -0400
++++ pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478/src/modules/alsa/mixer/paths/analog-output.conf	2010-09-18 08:44:17.000000000 -0400
+@@ -59,6 +59,10 @@
+ switch = mute
+ volume = off
+ 
++[Element Desktop Speaker]
++switch = mute
++volume = off
++
+ [Element Front]
+ switch = mute
+ volume = merge
+Index: pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478/src/modules/alsa/mixer/paths/analog-output-desktop-speaker.conf
+===================================================================
+--- /dev/null	1970-01-01 00:00:00.000000000 +0000
++++ pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478/src/modules/alsa/mixer/paths/analog-output-desktop-speaker.conf	2010-09-18 08:44:02.000000000 -0400
+@@ -0,0 +1,99 @@
++# This file is part of PulseAudio.
++#
++# PulseAudio is free software; you can redistribute it and/or modify
++# it under the terms of the GNU Lesser General Public License as
++# published by the Free Software Foundation; either version 2.1 of the
++# License, or (at your option) any later version.
++#
++# PulseAudio is distributed in the hope that it will be useful, but
++# WITHOUT ANY WARRANTY; without even the implied warranty of
++# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
++# General Public License for more details.
++#
++# You should have received a copy of the GNU Lesser General Public License
++# along with PulseAudio; if not, write to the Free Software Foundation,
++# Inc., 59 Temple Place, Suite 330, Boston, MA 02111-1307 USA.
++
++; Path for mixers that have a 'Desktop Speaker' control
++;
++; See analog-output.conf.common for an explanation on the directives
++
++[General]
++priority = 101
++name = analog-output-speaker
++
++[Element Hardware Master]
++switch = mute
++volume = merge
++override-map.1 = all
++override-map.2 = all-left,all-right
++
++[Element Master]
++switch = mute
++volume = merge
++override-map.1 = all
++override-map.2 = all-left,all-right
++
++[Element Master Mono]
++switch = off
++volume = off
++
++; This profile path is intended to control the desktop speaker, not
++; the headphones. But it should not hurt if we leave the headphone
++; jack enabled nonetheless.
++[Element Headphone]
++switch = mute
++volume = zero
++
++[Element Headphone2]
++switch = mute
++volume = zero
++
++[Element Speaker]
++switch = off
++volume = off
++
++[Element Desktop Speaker]
++required = any
++switch = mute
++volume = merge
++override-map.1 = all
++override-map.2 = all-left,all-right
++
++[Element Front]
++switch = mute
++volume = merge
++override-map.1 = all-front
++override-map.2 = front-left,front-right
++
++[Element Rear]
++switch = mute
++volume = merge
++override-map.1 = all-rear
++override-map.2 = rear-left,rear-right
++
++[Element Surround]
++switch = mute
++volume = merge
++override-map.1 = all-rear
++override-map.2 = rear-left,rear-right
++
++[Element Side]
++switch = mute
++volume = merge
++override-map.1 = all-side
++override-map.2 = side-left,side-right
++
++[Element Center]
++switch = mute
++volume = merge
++override-map.1 = all-center
++override-map.2 = all-center,all-center
++
++[Element LFE]
++switch = mute
++volume = merge
++override-map.1 = lfe
++override-map.2 = lfe,lfe
++
++.include analog-output.conf.common
+Index: pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478/src/modules/alsa/mixer/paths/analog-output-headphones-2.conf
+===================================================================
+--- pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478.orig/src/modules/alsa/mixer/paths/analog-output-headphones-2.conf	2010-09-18 08:44:02.000000000 -0400
++++ pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478/src/modules/alsa/mixer/paths/analog-output-headphones-2.conf	2010-09-18 08:44:02.000000000 -0400
+@@ -20,6 +20,7 @@
+ 
+ [General]
+ priority = 89
++name = analog-output-headphones
+ 
+ [Element Hardware Master]
+ switch = mute
+@@ -61,6 +62,10 @@
+ switch = off
+ volume = off
+ 
++[Element Desktop Speaker]
++switch = off
++volume = off
++
+ [Element Front]
+ switch = off
+ volume = off
+Index: pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478/src/modules/alsa/mixer/paths/analog-output-headphones.conf
+===================================================================
+--- pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478.orig/src/modules/alsa/mixer/paths/analog-output-headphones.conf	2010-09-18 08:44:02.000000000 -0400
++++ pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478/src/modules/alsa/mixer/paths/analog-output-headphones.conf	2010-09-18 08:44:17.000000000 -0400
+@@ -20,6 +20,7 @@
+ 
+ [General]
+ priority = 90
++name = analog-output-headphones
+ 
+ [Element Hardware Master]
+ switch = mute
+@@ -61,6 +62,10 @@
+ switch = off
+ volume = off
+ 
++[Element Desktop Speaker]
++switch = off
++volume = off
++
+ [Element Front]
+ switch = off
+ volume = off
+Index: pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478/src/modules/alsa/mixer/paths/analog-output-lfe-on-mono.conf
+===================================================================
+--- pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478.orig/src/modules/alsa/mixer/paths/analog-output-lfe-on-mono.conf	2009-10-30 22:49:39.000000000 -0400
++++ pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478/src/modules/alsa/mixer/paths/analog-output-lfe-on-mono.conf	2010-09-18 08:44:02.000000000 -0400
+@@ -58,6 +58,10 @@
+ override-map.1 = all
+ override-map.2 = all-left,all-right
+ 
++[Element Desktop Speaker]
++switch = off
++volume = off
++
+ [Element Front]
+ switch = off
+ volume = off
+Index: pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478/src/modules/alsa/mixer/paths/analog-output-mono.conf
+===================================================================
+--- pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478.orig/src/modules/alsa/mixer/paths/analog-output-mono.conf	2010-09-18 08:44:02.000000000 -0400
++++ pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478/src/modules/alsa/mixer/paths/analog-output-mono.conf	2010-09-18 08:44:02.000000000 -0400
+@@ -59,6 +59,10 @@
+ override-map.1 = all
+ override-map.2 = all-left,all-right
+ 
++[Element Desktop Speaker]
++switch = off
++volume = off
++
+ [Element Front]
+ switch = off
+ volume = off
+Index: pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478/src/modules/alsa/mixer/paths/analog-output-speaker.conf
+===================================================================
+--- pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478.orig/src/modules/alsa/mixer/paths/analog-output-speaker.conf	2010-09-18 08:44:02.000000000 -0400
++++ pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478/src/modules/alsa/mixer/paths/analog-output-speaker.conf	2010-09-18 08:44:02.000000000 -0400
+@@ -20,6 +20,7 @@
+ 
+ [General]
+ priority = 100
++name = analog-output-speaker
+ 
+ [Element Hardware Master]
+ switch = mute
+@@ -61,6 +62,10 @@
+ override-map.1 = all
+ override-map.2 = all-left,all-right
+ 
++[Element Desktop Speaker]
++switch = off
++volume = off
++
+ [Element Front]
+ switch = mute
+ volume = merge
+Index: pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478/src/modules/alsa/mixer/profile-sets/90-pulseaudio.rules
+===================================================================
+--- pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478.orig/src/modules/alsa/mixer/profile-sets/90-pulseaudio.rules	2010-01-17 21:00:16.000000000 -0500
++++ pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478/src/modules/alsa/mixer/profile-sets/90-pulseaudio.rules	2010-09-18 08:44:02.000000000 -0400
+@@ -22,6 +22,7 @@
+ 
+ SUBSYSTEMS=="usb", ATTRS{idVendor}=="17cc", ATTRS{idProduct}=="1978", ENV{PULSE_PROFILE_SET}="native-instruments-audio8dj.conf"
+ SUBSYSTEMS=="usb", ATTRS{idVendor}=="17cc", ATTRS{idProduct}=="0839", ENV{PULSE_PROFILE_SET}="native-instruments-audio4dj.conf"
++SUBSYSTEMS=="usb", ATTRS{idVendor}=="17cc", ATTRS{idProduct}=="baff", ENV{PULSE_PROFILE_SET}="native-instruments-traktorkontrol-s4.conf"
+ SUBSYSTEMS=="usb", ATTRS{idVendor}=="0763", ATTRS{idProduct}=="2012", ENV{PULSE_PROFILE_SET}="maudio-fasttrack-pro.conf"
+ 
+ LABEL="pulseaudio_end"
+Index: pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478/src/modules/alsa/mixer/profile-sets/default.conf
+===================================================================
+--- pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478.orig/src/modules/alsa/mixer/profile-sets/default.conf	2009-10-30 22:49:39.000000000 -0400
++++ pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478/src/modules/alsa/mixer/profile-sets/default.conf	2010-09-18 08:44:02.000000000 -0400
+@@ -62,42 +62,42 @@
+ [Mapping analog-mono]
+ device-strings = hw:%f
+ channel-map = mono
+-paths-output = analog-output analog-output-speaker analog-output-headphones analog-output-headphones-2 analog-output-mono analog-output-lfe-on-mono
++paths-output = analog-output analog-output-speaker analog-output-desktop-speaker analog-output-headphones analog-output-headphones-2 analog-output-mono analog-output-lfe-on-mono
+ paths-input = analog-input analog-input-mic analog-input-linein analog-input-aux analog-input-video analog-input-tvtuner analog-input-fm analog-input-mic-line
+ priority = 1
+ 
+ [Mapping analog-stereo]
+ device-strings = front:%f hw:%f
+ channel-map = left,right
+-paths-output = analog-output analog-output-speaker analog-output-headphones analog-output-headphones-2 analog-output-mono analog-output-lfe-on-mono
++paths-output = analog-output analog-output-speaker analog-output-desktop-speaker analog-output-headphones analog-output-headphones-2 analog-output-mono analog-output-lfe-on-mono
+ paths-input = analog-input analog-input-mic analog-input-linein analog-input-aux analog-input-video analog-input-tvtuner analog-input-fm analog-input-mic-line
+ priority = 10
+ 
+ [Mapping analog-surround-40]
+ device-strings = surround40:%f
+ channel-map = front-left,front-right,rear-left,rear-right
+-paths-output = analog-output analog-output-speaker analog-output-lfe-on-mono
++paths-output = analog-output analog-output-speaker analog-output-desktop-speaker analog-output-lfe-on-mono
+ priority = 7
+ direction = output
+ 
+ [Mapping analog-surround-41]
+ device-strings = surround41:%f
+ channel-map = front-left,front-right,rear-left,rear-right,lfe
+-paths-output = analog-output analog-output-speaker analog-output-lfe-on-mono
++paths-output = analog-output analog-output-speaker analog-output-desktop-speaker analog-output-lfe-on-mono
+ priority = 8
+ direction = output
+ 
+ [Mapping analog-surround-50]
+ device-strings = surround50:%f
+ channel-map = front-left,front-right,rear-left,rear-right,front-center
+-paths-output = analog-output analog-output-speaker analog-output-lfe-on-mono
++paths-output = analog-output analog-output-speaker analog-output-desktop-speaker analog-output-lfe-on-mono
+ priority = 7
+ direction = output
+ 
+ [Mapping analog-surround-51]
+ device-strings = surround51:%f
+ channel-map = front-left,front-right,rear-left,rear-right,front-center,lfe
+-paths-output = analog-output analog-output-speaker analog-output-lfe-on-mono
++paths-output = analog-output analog-output-speaker analog-output-desktop-speaker analog-output-lfe-on-mono
+ priority = 8
+ direction = output
+ 
+@@ -105,7 +105,7 @@
+ device-strings = surround71:%f
+ channel-map = front-left,front-right,rear-left,rear-right,front-center,lfe,side-left,side-right
+ description = Analog Surround 7.1
+-paths-output = analog-output analog-output-speaker analog-output-lfe-on-mono
++paths-output = analog-output analog-output-speaker analog-output-desktop-speaker analog-output-lfe-on-mono
+ priority = 7
+ direction = output
+ 
+Index: pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478/src/modules/alsa/mixer/profile-sets/native-instruments-traktorkontrol-s4.conf
+===================================================================
+--- /dev/null	1970-01-01 00:00:00.000000000 +0000
++++ pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478/src/modules/alsa/mixer/profile-sets/native-instruments-traktorkontrol-s4.conf	2010-09-18 08:44:02.000000000 -0400
+@@ -0,0 +1,81 @@
++# This file is part of PulseAudio.
++#
++# PulseAudio is free software; you can redistribute it and/or modify
++# it under the terms of the GNU Lesser General Public License as
++# published by the Free Software Foundation; either version 2.1 of the
++# License, or (at your option) any later version.
++#
++# PulseAudio is distributed in the hope that it will be useful, but
++# WITHOUT ANY WARRANTY; without even the implied warranty of
++# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
++# General Public License for more details.
++#
++# You should have received a copy of the GNU Lesser General Public License
++# along with PulseAudio; if not, write to the Free Software Foundation,
++# Inc., 59 Temple Place, Suite 330, Boston, MA 02111-1307 USA.
++
++; Native Instruments Traktor Kontrol S4
++;
++; This controller has two stereo pairs of input (named "Channel C" and
++; "Channel D") and two stereo pairs of output, one "Main Out" and
++; "Headphone Out".
++;
++; See default.conf for an explanation on the directives used here.
++
++[General]
++auto-profiles = no
++
++[Mapping analog-stereo-output-main]
++description = Analog Stereo Main Out
++device-strings = hw:%f,0,0
++channel-map = left,right
++
++[Mapping analog-stereo-output-headphone]
++description = Analog Stereo Headphones Out
++device-strings = hw:%f,0,1
++channel-map = left,right
++direction = output
++
++[Mapping analog-stereo-c-input]
++description = Analog Stereo Channel C
++device-strings = hw:%f,0,1
++channel-map = left,right
++direction = input
++
++[Mapping analog-stereo-d-input]
++description = Analog Stereo Channel D
++device-strings = hw:%f,0,1
++channel-map = left,right
++direction = input
++
++[Profile output:analog-stereo-all+input:analog-stereo-all]
++description = Analog Stereo Duplex
++output-mappings = analog-stereo-output-main analog-stereo-output-headphone
++input-mappings = analog-stereo-c-input analog-stereo-d-input
++priority = 100
++skip-probe = yes
++
++[Profile output:analog-stereo-main]
++description = Analog Stereo Main Output
++output-mappings = analog-stereo-output-main
++priority = 4
++skip-probe = yes
++
++[Profile output:analog-stereo-headphone]
++description = Analog Stereo Output Headphones Out
++output-mappings = analog-stereo-output-headphone
++priority = 3
++skip-probe = yes
++
++[Profile input:analog-stereo-c]
++description = Analog Stereo Input Channel C
++input-mappings = analog-stereo-c-input
++priority = 2
++skip-probe = yes
++
++[Profile input:analog-stereo-d]
++description = Analog Stereo Input Channel D
++input-mappings = analog-stereo-d-input
++priority = 1
++skip-probe = yes
++
+Index: pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478/src/modules/alsa/module-alsa-sink.c
+===================================================================
+--- pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478.orig/src/modules/alsa/module-alsa-sink.c	2009-06-18 17:42:19.000000000 -0400
++++ pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478/src/modules/alsa/module-alsa-sink.c	2010-09-18 08:44:02.000000000 -0400
+@@ -54,7 +54,8 @@
+         "tsched_buffer_size=<buffer size when using timer based scheduling> "
+         "tsched_buffer_watermark=<lower fill watermark> "
+         "ignore_dB=<ignore dB information from the device?> "
+-        "control=<name of mixer control>");
++        "control=<name of mixer control>"
++        "rewind_safeguard=<number of bytes that cannot be rewound");
+ 
+ static const char* const valid_modargs[] = {
+     "name",
+@@ -74,6 +75,7 @@
+     "tsched_buffer_watermark",
+     "ignore_dB",
+     "control",
++    "rewind_safeguard",
+     NULL
+ };
+ 
+Index: pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478/src/modules/bluetooth/module-bluetooth-device.c
+===================================================================
+--- pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478.orig/src/modules/bluetooth/module-bluetooth-device.c	2010-01-17 18:54:19.000000000 -0500
++++ pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478/src/modules/bluetooth/module-bluetooth-device.c	2010-09-18 08:44:02.000000000 -0400
+@@ -2041,7 +2041,7 @@
+     }
+ #endif
+ 
+-    if (!(u->thread = pa_thread_new(thread_func, u))) {
++    if (!(u->thread = pa_thread_new("bluetooth", thread_func, u))) {
+         pa_log_error("Failed to create IO thread");
+         stop_thread(u);
+         return -1;
+Index: pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478/src/modules/jack/module-jack-sink.c
+===================================================================
+--- pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478.orig/src/modules/jack/module-jack-sink.c	2009-11-11 15:38:11.000000000 -0500
++++ pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478/src/modules/jack/module-jack-sink.c	2010-09-18 08:44:02.000000000 -0400
+@@ -147,6 +147,7 @@
+                 pa_sample_spec ss;
+ 
+                 /* Humm, we're not RUNNING, hence let's write some silence */
++                /* This can happen if we're paused, or during shutdown (when we're unlinked but jack is still running). */
+ 
+                 ss = u->sink->sample_spec;
+                 ss.channels = 1;
+@@ -197,6 +198,7 @@
+     return pa_sink_process_msg(o, code, data, offset, memchunk);
+ }
+ 
++/* JACK Callback: This is called when JACK needs some data */
+ static int jack_process(jack_nframes_t nframes, void *arg) {
+     struct userdata *u = arg;
+     unsigned c;
+@@ -250,6 +252,7 @@
+     pa_log_debug("Thread shutting down");
+ }
+ 
++/* JACK Callback: This is called when JACK triggers an error */
+ static void jack_error_func(const char*t) {
+     char *s;
+ 
+@@ -258,6 +261,7 @@
+     pa_xfree(s);
+ }
+ 
++/* JACK Callback: This is called when JACK is set up */
+ static void jack_init(void *arg) {
+     struct userdata *u = arg;
+ 
+@@ -267,6 +271,7 @@
+         pa_make_realtime(u->core->realtime_priority+4);
+ }
+ 
++/* JACK Callback: This is called when JACK kicks us */
+ static void jack_shutdown(void* arg) {
+     struct userdata *u = arg;
+ 
+@@ -274,6 +279,7 @@
+     pa_asyncmsgq_post(u->jack_msgq, PA_MSGOBJECT(u->sink), SINK_MESSAGE_ON_SHUTDOWN, NULL, 0, NULL, NULL);
+ }
+ 
++/* JACK Callback: This is called when JACK changes the buffer size */
+ static int jack_buffer_size(jack_nframes_t nframes, void *arg) {
+     struct userdata *u = arg;
+ 
+@@ -413,7 +419,7 @@
+     jack_set_thread_init_callback(u->client, jack_init, u);
+     jack_set_buffer_size_callback(u->client, jack_buffer_size, u);
+ 
+-    if (!(u->thread = pa_thread_new(thread_func, u))) {
++    if (!(u->thread = pa_thread_new("jack-sink", thread_func, u))) {
+         pa_log("Failed to create thread.");
+         goto fail;
+     }
+@@ -475,12 +481,12 @@
+     if (!(u = m->userdata))
+         return;
+ 
+-    if (u->client)
+-        jack_client_close(u->client);
+-
+     if (u->sink)
+         pa_sink_unlink(u->sink);
+ 
++    if (u->client)
++        jack_client_close(u->client);
++
+     if (u->thread) {
+         pa_asyncmsgq_send(u->thread_mq.inq, NULL, PA_MESSAGE_SHUTDOWN, NULL, 0, NULL);
+         pa_thread_free(u->thread);
+Index: pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478/src/modules/jack/module-jack-source.c
+===================================================================
+--- pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478.orig/src/modules/jack/module-jack-source.c	2009-11-11 15:38:11.000000000 -0500
++++ pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478/src/modules/jack/module-jack-source.c	2010-09-18 08:44:02.000000000 -0400
+@@ -363,7 +363,7 @@
+     jack_on_shutdown(u->client, jack_shutdown, u);
+     jack_set_thread_init_callback(u->client, jack_init, u);
+ 
+-    if (!(u->thread = pa_thread_new(thread_func, u))) {
++    if (!(u->thread = pa_thread_new("jack-source", thread_func, u))) {
+         pa_log("Failed to create thread.");
+         goto fail;
+     }
+@@ -425,12 +425,12 @@
+     if (!(u = m->userdata))
+         return;
+ 
+-    if (u->client)
+-        jack_client_close(u->client);
+-
+     if (u->source)
+         pa_source_unlink(u->source);
+ 
++    if (u->client)
++        jack_client_close(u->client);
++
+     if (u->thread) {
+         pa_asyncmsgq_send(u->thread_mq.inq, NULL, PA_MESSAGE_SHUTDOWN, NULL, 0, NULL);
+         pa_thread_free(u->thread);
+Index: pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478/src/modules/module-combine.c
+===================================================================
+--- pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478.orig/src/modules/module-combine.c	2010-01-17 21:00:16.000000000 -0500
++++ pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478/src/modules/module-combine.c	2010-09-18 08:44:02.000000000 -0400
+@@ -1304,7 +1304,7 @@
+     u->sink_unlink_slot = pa_hook_connect(&m->core->hooks[PA_CORE_HOOK_SINK_UNLINK], PA_HOOK_EARLY, (pa_hook_cb_t) sink_unlink_hook_cb, u);
+     u->sink_state_changed_slot = pa_hook_connect(&m->core->hooks[PA_CORE_HOOK_SINK_STATE_CHANGED], PA_HOOK_NORMAL, (pa_hook_cb_t) sink_state_changed_hook_cb, u);
+ 
+-    if (!(u->thread = pa_thread_new(thread_func, u))) {
++    if (!(u->thread = pa_thread_new("combine", thread_func, u))) {
+         pa_log("Failed to create thread.");
+         goto fail;
+     }
+Index: pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478/src/modules/module-esound-sink.c
+===================================================================
+--- pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478.orig/src/modules/module-esound-sink.c	2009-06-23 01:10:59.000000000 -0400
++++ pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478/src/modules/module-esound-sink.c	2010-09-18 08:44:02.000000000 -0400
+@@ -628,7 +628,7 @@
+     /* Reserve space for the response */
+     u->read_data = pa_xmalloc(u->read_length = sizeof(int32_t));
+ 
+-    if (!(u->thread = pa_thread_new(thread_func, u))) {
++    if (!(u->thread = pa_thread_new("esound-sink", thread_func, u))) {
+         pa_log("Failed to create thread.");
+         goto fail;
+     }
+Index: pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478/src/modules/module-intended-roles.c
+===================================================================
+--- pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478.orig/src/modules/module-intended-roles.c	2009-08-15 19:08:57.000000000 -0400
++++ pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478/src/modules/module-intended-roles.c	2010-09-18 08:44:02.000000000 -0400
+@@ -123,6 +123,7 @@
+             return PA_HOOK_OK;
+         }
+ 
++    /* @todo: favour the highest priority device, not the first one we find? */
+     PA_IDXSET_FOREACH(s, c->sinks, idx) {
+         if (s == def)
+             continue;
+@@ -173,12 +174,16 @@
+         }
+ 
+     PA_IDXSET_FOREACH(s, c->sources, idx) {
++        if (s->monitor_of)
++            continue;
++
+         if (s == def)
+             continue;
+ 
+         if (!PA_SOURCE_IS_LINKED(pa_source_get_state(s)))
+             continue;
+ 
++        /* @todo: favour the highest priority device, not the first one we find? */
+         if (role_match(s->proplist, role)) {
+             new_data->source = s;
+             new_data->save_source = FALSE;
+@@ -242,6 +247,9 @@
+     pa_assert(u);
+     pa_assert(u->on_hotplug);
+ 
++    if (source->monitor_of)
++        return PA_HOOK_OK;
++
+     PA_IDXSET_FOREACH(so, c->source_outputs, idx) {
+         const char *role;
+ 
+@@ -315,6 +323,7 @@
+                 continue;
+ 
+         /* Try to find some other fitting sink */
++        /* @todo: favour the highest priority device, not the first one we find? */
+         PA_IDXSET_FOREACH(d, c->sinks, jdx) {
+             if (d == def || d == sink)
+                 continue;
+@@ -370,6 +379,7 @@
+         }
+ 
+         /* Try to find some other fitting source */
++        /* @todo: favour the highest priority device, not the first one we find? */
+         PA_IDXSET_FOREACH(d, c->sources, jdx) {
+             if (d == def || d == source)
+                 continue;
+@@ -377,7 +387,8 @@
+             if (!PA_SOURCE_IS_LINKED(pa_source_get_state(d)))
+                 continue;
+ 
+-            if (role_match(d->proplist, role) && !source->monitor_of == !d->monitor_of) {
++            /* If moving from a monitor, move to another monitor */
++            if (!source->monitor_of == !d->monitor_of && role_match(d->proplist, role)) {
+                 pa_source_output_move_to(so, d, FALSE);
+                 break;
+             }
+Index: pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478/src/modules/module-null-sink.c
+===================================================================
+--- pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478.orig/src/modules/module-null-sink.c	2009-09-03 20:56:09.000000000 -0400
++++ pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478/src/modules/module-null-sink.c	2010-09-18 08:44:02.000000000 -0400
+@@ -317,7 +317,7 @@
+     pa_sink_set_max_rewind(u->sink, nbytes);
+     pa_sink_set_max_request(u->sink, nbytes);
+ 
+-    if (!(u->thread = pa_thread_new(thread_func, u))) {
++    if (!(u->thread = pa_thread_new("null-sink", thread_func, u))) {
+         pa_log("Failed to create thread.");
+         goto fail;
+     }
+Index: pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478/src/modules/module-pipe-sink.c
+===================================================================
+--- pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478.orig/src/modules/module-pipe-sink.c	2010-01-17 18:54:19.000000000 -0500
++++ pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478/src/modules/module-pipe-sink.c	2010-09-18 08:44:02.000000000 -0400
+@@ -307,7 +307,7 @@
+     pollfd->fd = u->fd;
+     pollfd->events = pollfd->revents = 0;
+ 
+-    if (!(u->thread = pa_thread_new(thread_func, u))) {
++    if (!(u->thread = pa_thread_new("pipe-sink", thread_func, u))) {
+         pa_log("Failed to create thread.");
+         goto fail;
+     }
+Index: pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478/src/modules/module-pipe-source.c
+===================================================================
+--- pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478.orig/src/modules/module-pipe-source.c	2010-01-17 18:54:19.000000000 -0500
++++ pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478/src/modules/module-pipe-source.c	2010-09-18 08:44:02.000000000 -0400
+@@ -291,7 +291,7 @@
+     pollfd->fd = u->fd;
+     pollfd->events = pollfd->revents = 0;
+ 
+-    if (!(u->thread = pa_thread_new(thread_func, u))) {
++    if (!(u->thread = pa_thread_new("pipe-source", thread_func, u))) {
+         pa_log("Failed to create thread.");
+         goto fail;
+     }
+Index: pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478/src/modules/module-sine-source.c
+===================================================================
+--- pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478.orig/src/modules/module-sine-source.c	2010-01-17 18:54:19.000000000 -0500
++++ pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478/src/modules/module-sine-source.c	2010-09-18 08:44:02.000000000 -0400
+@@ -274,7 +274,7 @@
+     pa_source_set_rtpoll(u->source, u->rtpoll);
+     pa_source_set_fixed_latency(u->source, u->block_usec);
+ 
+-    if (!(u->thread = pa_thread_new(thread_func, u))) {
++    if (!(u->thread = pa_thread_new("sine-source", thread_func, u))) {
+         pa_log("Failed to create thread.");
+         goto fail;
+     }
+Index: pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478/src/modules/module-stream-restore.c
+===================================================================
+--- pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478.orig/src/modules/module-stream-restore.c	2010-01-17 18:54:19.000000000 -0500
++++ pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478/src/modules/module-stream-restore.c	2010-09-18 08:44:02.000000000 -0400
+@@ -394,7 +394,7 @@
+         return PA_HOOK_OK;
+ 
+     if (new_data->sink)
+-        pa_log_debug("Not restoring device for stream %s, because already set.", name);
++        pa_log_debug("Not restoring device for stream %s, because already set to '%s'.", name, new_data->sink->name);
+     else if ((e = read_entry(u, name))) {
+         pa_sink *s = NULL;
+ 
+Index: pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478/src/modules/module-suspend-on-idle.c
+===================================================================
+--- pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478.orig/src/modules/module-suspend-on-idle.c	2009-08-28 22:31:49.000000000 -0400
++++ pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478/src/modules/module-suspend-on-idle.c	2010-09-18 08:44:02.000000000 -0400
+@@ -145,8 +145,9 @@
+     pa_assert(data);
+     pa_assert(u);
+ 
+-    if (data->flags & PA_SINK_INPUT_START_CORKED)
+-        return PA_HOOK_OK;
++    /* We need to resume the audio device here even for
++     * PA_SINK_INPUT_START_CORKED, since we need the device parameters
++     * to be fully available while the stream is set up. */
+ 
+     if ((d = pa_hashmap_get(u->device_infos, data->sink)))
+         resume(d);
+@@ -161,9 +162,6 @@
+     pa_assert(data);
+     pa_assert(u);
+ 
+-    if (data->flags & PA_SOURCE_OUTPUT_START_CORKED)
+-        return PA_HOOK_OK;
+-
+     if (data->source->monitor_of)
+         d = pa_hashmap_get(u->device_infos, data->source->monitor_of);
+     else
+Index: pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478/src/modules/module-tunnel.c
+===================================================================
+--- pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478.orig/src/modules/module-tunnel.c	2009-09-20 16:42:43.000000000 -0400
++++ pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478/src/modules/module-tunnel.c	2010-09-18 08:44:02.000000000 -0400
+@@ -2014,7 +2014,7 @@
+     u->fragsize = (uint32_t) -1;
+ #endif
+ 
+-    if (!(u->thread = pa_thread_new(thread_func, u))) {
++    if (!(u->thread = pa_thread_new("module-tunnel", thread_func, u))) {
+         pa_log("Failed to create thread.");
+         goto fail;
+     }
+Index: pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478/src/modules/oss/module-oss.c
+===================================================================
+--- pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478.orig/src/modules/oss/module-oss.c	2009-08-18 21:56:55.000000000 -0400
++++ pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478/src/modules/oss/module-oss.c	2010-09-18 08:44:02.000000000 -0400
+@@ -1456,7 +1456,7 @@
+ 
+     pa_memchunk_reset(&u->memchunk);
+ 
+-    if (!(u->thread = pa_thread_new(thread_func, u))) {
++    if (!(u->thread = pa_thread_new("oss", thread_func, u))) {
+         pa_log("Failed to create thread.");
+         goto fail;
+     }
+Index: pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478/src/modules/raop/module-raop-sink.c
+===================================================================
+--- pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478.orig/src/modules/raop/module-raop-sink.c	2010-01-17 18:54:19.000000000 -0500
++++ pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478/src/modules/raop/module-raop-sink.c	2010-09-18 08:44:02.000000000 -0400
+@@ -620,7 +620,7 @@
+     pa_raop_client_set_callback(u->raop, on_connection, u);
+     pa_raop_client_set_closed_callback(u->raop, on_close, u);
+ 
+-    if (!(u->thread = pa_thread_new(thread_func, u))) {
++    if (!(u->thread = pa_thread_new("raop-sink", thread_func, u))) {
+         pa_log("Failed to create thread.");
+         goto fail;
+     }
+Index: pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478/src/modules/rtp/rtp.c
+===================================================================
+--- pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478.orig/src/modules/rtp/rtp.c	2009-04-06 21:05:35.000000000 -0400
++++ pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478/src/modules/rtp/rtp.c	2010-09-18 08:44:02.000000000 -0400
+@@ -278,8 +278,8 @@
+         pa_memchunk_reset(&c->memchunk);
+     }
+ 
+-    for (cm = CMSG_FIRSTHDR(&m); cm; cm = CMSG_NXTHDR(&m, cm)) {
+-        if (cm->cmsg_level == SOL_SOCKET && cm->cmsg_type == SO_TIMESTAMP)
++    for (cm = CMSG_FIRSTHDR(&m); cm; cm = CMSG_NXTHDR(&m, cm))
++        if (cm->cmsg_level == SOL_SOCKET && cm->cmsg_type == SO_TIMESTAMP) {
+             memcpy(tstamp, CMSG_DATA(cm), sizeof(struct timeval));
+             found_tstamp = TRUE;
+             break;
+Index: pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478/src/modules/udev-util.c
+===================================================================
+--- pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478.orig/src/modules/udev-util.c	2010-01-17 18:54:19.000000000 -0500
++++ pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478/src/modules/udev-util.c	2010-09-18 08:44:02.000000000 -0400
+@@ -63,10 +63,10 @@
+         return x - '0';
+ 
+     if (x >= 'A' && x <= 'F')
+-        return x - 'A';
++        return x - 'A' + 10;
+ 
+     if (x >= 'a' && x <= 'f')
+-        return x - 'a';
++        return x - 'a' + 10;
+ 
+     return -1;
+ }
+Index: pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478/src/modules/x11/module-x11-publish.c
+===================================================================
+--- pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478.orig/src/modules/x11/module-x11-publish.c	2009-09-08 18:15:50.000000000 -0400
++++ pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478/src/modules/x11/module-x11-publish.c	2010-09-18 08:56:44.000000000 -0400
+@@ -28,8 +28,7 @@
+ #include <string.h>
+ #include <unistd.h>
+ 
+-#include <X11/Xlib.h>
+-#include <X11/Xatom.h>
++#include <xcb/xcb.h>
+ 
+ #include <pulse/util.h>
+ #include <pulse/xmalloc.h>
+@@ -85,6 +84,8 @@
+ 
+ static void publish_servers(struct userdata *u, pa_strlist *l) {
+ 
++    int screen = DefaultScreen(pa_x11_wrapper_get_display(u->x11_wrapper));
++
+     if (l) {
+         char *s;
+ 
+@@ -92,20 +93,22 @@
+         s = pa_strlist_tostring(l);
+         pa_strlist_reverse(l);
+ 
+-        pa_x11_set_prop(pa_x11_wrapper_get_display(u->x11_wrapper), "PULSE_SERVER", s);
++        pa_x11_set_prop(pa_x11_wrapper_get_xcb_connection(u->x11_wrapper), screen, "PULSE_SERVER", s);
+         pa_xfree(s);
+     } else
+-        pa_x11_del_prop(pa_x11_wrapper_get_display(u->x11_wrapper), "PULSE_SERVER");
++        pa_x11_del_prop(pa_x11_wrapper_get_xcb_connection(u->x11_wrapper), screen, "PULSE_SERVER");
+ }
+ 
+ static pa_hook_result_t servers_changed_cb(void *hook_data, void *call_data, void *slot_data) {
+     pa_strlist *servers = call_data;
+     struct userdata *u = slot_data;
+     char t[256];
++    int screen;
+ 
+     pa_assert(u);
+ 
+-    if (!pa_x11_get_prop(pa_x11_wrapper_get_display(u->x11_wrapper), "PULSE_ID", t, sizeof(t)) || strcmp(t, u->id)) {
++    screen = DefaultScreen(pa_x11_wrapper_get_display(u->x11_wrapper));
++    if (!pa_x11_get_prop(pa_x11_wrapper_get_xcb_connection(u->x11_wrapper), screen, "PULSE_ID", t, sizeof(t)) || strcmp(t, u->id)) {
+         pa_log_warn("PulseAudio information vanished from X11!");
+         return PA_HOOK_OK;
+     }
+@@ -139,6 +142,7 @@
+     char *mid, *sid;
+     char hx[PA_NATIVE_COOKIE_LENGTH*2+1];
+     const char *t;
++    int screen;
+ 
+     pa_assert(m);
+ 
+@@ -164,26 +168,27 @@
+     if (!(u->x11_wrapper = pa_x11_wrapper_get(m->core, pa_modargs_get_value(ma, "display", NULL))))
+         goto fail;
+ 
++    screen = DefaultScreen(pa_x11_wrapper_get_display(u->x11_wrapper));
+     mid = pa_machine_id();
+     u->id = pa_sprintf_malloc("%lu@%s/%lu", (unsigned long) getuid(), mid, (unsigned long) getpid());
+     pa_xfree(mid);
+ 
+-    pa_x11_set_prop(pa_x11_wrapper_get_display(u->x11_wrapper), "PULSE_ID", u->id);
++    pa_x11_set_prop(pa_x11_wrapper_get_xcb_connection(u->x11_wrapper), screen, "PULSE_ID", u->id);
+ 
+     if ((sid = pa_session_id())) {
+-        pa_x11_set_prop(pa_x11_wrapper_get_display(u->x11_wrapper), "PULSE_SESSION_ID", sid);
++        pa_x11_set_prop(pa_x11_wrapper_get_xcb_connection(u->x11_wrapper), screen, "PULSE_SESSION_ID", sid);
+         pa_xfree(sid);
+     }
+ 
+     publish_servers(u, pa_native_protocol_servers(u->protocol));
+ 
+     if ((t = pa_modargs_get_value(ma, "source", NULL)))
+-        pa_x11_set_prop(pa_x11_wrapper_get_display(u->x11_wrapper), "PULSE_SOURCE", t);
++        pa_x11_set_prop(pa_x11_wrapper_get_xcb_connection(u->x11_wrapper), screen, "PULSE_SOURCE", t);
+ 
+     if ((t = pa_modargs_get_value(ma, "sink", NULL)))
+-        pa_x11_set_prop(pa_x11_wrapper_get_display(u->x11_wrapper), "PULSE_SINK", t);
++        pa_x11_set_prop(pa_x11_wrapper_get_xcb_connection(u->x11_wrapper), screen, "PULSE_SINK", t);
+ 
+-    pa_x11_set_prop(pa_x11_wrapper_get_display(u->x11_wrapper), "PULSE_COOKIE",
++    pa_x11_set_prop(pa_x11_wrapper_get_xcb_connection(u->x11_wrapper), screen, "PULSE_COOKIE",
+                     pa_hexstr(pa_auth_cookie_read(u->auth_cookie, PA_NATIVE_COOKIE_LENGTH), PA_NATIVE_COOKIE_LENGTH, hx, sizeof(hx)));
+ 
+     u->x11_client = pa_x11_client_new(u->x11_wrapper, NULL, x11_kill_cb, u);
+@@ -214,18 +219,19 @@
+ 
+     if (u->x11_wrapper) {
+         char t[256];
++        int screen = DefaultScreen(pa_x11_wrapper_get_display(u->x11_wrapper));
+ 
+         /* Yes, here is a race condition */
+-        if (!pa_x11_get_prop(pa_x11_wrapper_get_display(u->x11_wrapper), "PULSE_ID", t, sizeof(t)) || strcmp(t, u->id))
++        if (!pa_x11_get_prop(pa_x11_wrapper_get_xcb_connection(u->x11_wrapper), screen, "PULSE_ID", t, sizeof(t)) || strcmp(t, u->id))
+             pa_log_warn("PulseAudio information vanished from X11!");
+         else {
+-            pa_x11_del_prop(pa_x11_wrapper_get_display(u->x11_wrapper), "PULSE_ID");
+-            pa_x11_del_prop(pa_x11_wrapper_get_display(u->x11_wrapper), "PULSE_SERVER");
+-            pa_x11_del_prop(pa_x11_wrapper_get_display(u->x11_wrapper), "PULSE_SINK");
+-            pa_x11_del_prop(pa_x11_wrapper_get_display(u->x11_wrapper), "PULSE_SOURCE");
+-            pa_x11_del_prop(pa_x11_wrapper_get_display(u->x11_wrapper), "PULSE_COOKIE");
+-            pa_x11_del_prop(pa_x11_wrapper_get_display(u->x11_wrapper), "PULSE_SESSION_ID");
+-            XSync(pa_x11_wrapper_get_display(u->x11_wrapper), False);
++            pa_x11_del_prop(pa_x11_wrapper_get_xcb_connection(u->x11_wrapper), screen, "PULSE_ID");
++            pa_x11_del_prop(pa_x11_wrapper_get_xcb_connection(u->x11_wrapper), screen, "PULSE_SERVER");
++            pa_x11_del_prop(pa_x11_wrapper_get_xcb_connection(u->x11_wrapper), screen, "PULSE_SINK");
++            pa_x11_del_prop(pa_x11_wrapper_get_xcb_connection(u->x11_wrapper), screen, "PULSE_SOURCE");
++            pa_x11_del_prop(pa_x11_wrapper_get_xcb_connection(u->x11_wrapper), screen, "PULSE_COOKIE");
++            pa_x11_del_prop(pa_x11_wrapper_get_xcb_connection(u->x11_wrapper), screen, "PULSE_SESSION_ID");
++            xcb_flush(pa_x11_wrapper_get_xcb_connection(u->x11_wrapper));
+         }
+ 
+         pa_x11_wrapper_unref(u->x11_wrapper);
+Index: pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478/src/pulse/channelmap.c
+===================================================================
+--- pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478.orig/src/pulse/channelmap.c	2009-08-17 15:48:31.000000000 -0400
++++ pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478/src/pulse/channelmap.c	2010-09-18 08:44:02.000000000 -0400
+@@ -112,7 +112,7 @@
+     [PA_CHANNEL_POSITION_REAR_LEFT] = N_("Rear Left"),
+     [PA_CHANNEL_POSITION_REAR_RIGHT] = N_("Rear Right"),
+ 
+-    [PA_CHANNEL_POSITION_LFE] = N_("Low Frequency Emmiter"),
++    [PA_CHANNEL_POSITION_LFE] = N_("Subwoofer"),
+ 
+     [PA_CHANNEL_POSITION_FRONT_LEFT_OF_CENTER] = N_("Front Left-of-center"),
+     [PA_CHANNEL_POSITION_FRONT_RIGHT_OF_CENTER] = N_("Front Right-of-center"),
+Index: pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478/src/pulse/client-conf-x11.c
+===================================================================
+--- pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478.orig/src/pulse/client-conf-x11.c	2009-04-13 17:44:40.000000000 -0400
++++ pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478/src/pulse/client-conf-x11.c	2010-09-18 08:56:44.000000000 -0400
+@@ -25,8 +25,7 @@
+ 
+ #include <string.h>
+ 
+-#include <X11/Xlib.h>
+-#include <X11/Xatom.h>
++#include <xcb/xcb.h>
+ 
+ #include <pulse/xmalloc.h>
+ #include <pulse/i18n.h>
+@@ -39,8 +38,8 @@
+ #include "client-conf-x11.h"
+ 
+ int pa_client_conf_from_x11(pa_client_conf *c, const char *dname) {
+-    Display *d = NULL;
+-    int ret = -1;
++    xcb_connection_t *xcb = NULL;
++    int ret = -1, screen = 0;
+     char t[1024];
+ 
+     pa_assert(c);
+@@ -51,18 +50,23 @@
+     if (*dname == 0)
+         goto finish;
+ 
+-    if (!(d = XOpenDisplay(dname))) {
+-        pa_log(_("XOpenDisplay() failed"));
++    if (!(xcb = xcb_connect(dname, NULL))) {
++        pa_log(_("xcb_connect() failed"));
+         goto finish;
+     }
+ 
+-    if (pa_x11_get_prop(d, "PULSE_SERVER", t, sizeof(t))) {
++    if (xcb_connection_has_error(xcb)) {
++        pa_log(_("xcb_connection_has_error() returned true"));
++        goto finish;
++    }
++
++    if (pa_x11_get_prop(xcb, screen, "PULSE_SERVER", t, sizeof(t))) {
+         pa_bool_t disable_autospawn = TRUE;
+ 
+         pa_xfree(c->default_server);
+         c->default_server = pa_xstrdup(t);
+ 
+-        if (pa_x11_get_prop(d, "PULSE_SESSION_ID", t, sizeof(t))) {
++        if (pa_x11_get_prop(xcb, screen, "PULSE_SESSION_ID", t, sizeof(t))) {
+             char *id;
+ 
+             if ((id = pa_session_id())) {
+@@ -76,17 +80,17 @@
+             c->autospawn = FALSE;
+     }
+ 
+-    if (pa_x11_get_prop(d, "PULSE_SINK", t, sizeof(t))) {
++    if (pa_x11_get_prop(xcb, screen, "PULSE_SINK", t, sizeof(t))) {
+         pa_xfree(c->default_sink);
+         c->default_sink = pa_xstrdup(t);
+     }
+ 
+-    if (pa_x11_get_prop(d, "PULSE_SOURCE", t, sizeof(t))) {
++    if (pa_x11_get_prop(xcb, screen, "PULSE_SOURCE", t, sizeof(t))) {
+         pa_xfree(c->default_source);
+         c->default_source = pa_xstrdup(t);
+     }
+ 
+-    if (pa_x11_get_prop(d, "PULSE_COOKIE", t, sizeof(t))) {
++    if (pa_x11_get_prop(xcb, screen, "PULSE_COOKIE", t, sizeof(t))) {
+         uint8_t cookie[PA_NATIVE_COOKIE_LENGTH];
+ 
+         if (pa_parsehex(t, cookie, sizeof(cookie)) != sizeof(cookie)) {
+@@ -106,8 +110,8 @@
+     ret = 0;
+ 
+ finish:
+-    if (d)
+-        XCloseDisplay(d);
++    if (xcb)
++        xcb_disconnect(xcb);
+ 
+     return ret;
+ 
+Index: pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478/src/pulse/proplist.h
+===================================================================
+--- pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478.orig/src/pulse/proplist.h	2010-01-17 18:54:20.000000000 -0500
++++ pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478/src/pulse/proplist.h	2010-09-18 08:44:02.000000000 -0400
+@@ -59,7 +59,7 @@
+ /** For streams: an XDG icon name for the media. e.g. "audio-x-mp3" */
+ #define PA_PROP_MEDIA_ICON_NAME                "media.icon_name"
+ 
+-/** For streams: logic role of this media. One of the strings "video", "music", "game", "event", "phone", "animation", "production", "a11y" */
++/** For streams: logic role of this media. One of the strings "video", "music", "game", "event", "phone", "animation", "production", "a11y", "test" */
+ #define PA_PROP_MEDIA_ROLE                     "media.role"
+ 
+ /** For event sound streams: XDG event sound name. e.g. "message-new-email" (Event sound streams are those with media.role set to "event") */
+Index: pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478/src/pulse/thread-mainloop.c
+===================================================================
+--- pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478.orig/src/pulse/thread-mainloop.c	2010-01-17 21:00:16.000000000 -0500
++++ pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478/src/pulse/thread-mainloop.c	2010-09-18 08:44:02.000000000 -0400
+@@ -146,7 +146,7 @@
+ 
+     pa_assert(!m->thread || !pa_thread_is_running(m->thread));
+ 
+-    if (!(m->thread = pa_thread_new(thread, m)))
++    if (!(m->thread = pa_thread_new("threaded-ml", thread, m)))
+         return -1;
+ 
+     return 0;
+Index: pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478/src/pulsecore/core-scache.c
+===================================================================
+--- pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478.orig/src/pulsecore/core-scache.c	2009-09-07 14:48:33.000000000 -0400
++++ pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478/src/pulsecore/core-scache.c	2010-09-18 08:44:02.000000000 -0400
+@@ -310,7 +310,8 @@
+         return -1;
+ 
+     merged = pa_proplist_new();
+-    pa_proplist_setf(merged, PA_PROP_MEDIA_NAME, "Sample %s", name);
++    pa_proplist_sets(merged, PA_PROP_MEDIA_NAME, name);
++    pa_proplist_sets(merged, PA_PROP_EVENT_ID, name);
+ 
+     if (e->lazy && !e->memchunk.memblock) {
+         pa_channel_map old_channel_map = e->channel_map;
+@@ -350,7 +351,12 @@
+     if (p)
+         pa_proplist_update(merged, PA_UPDATE_REPLACE, p);
+ 
+-    if (pa_play_memchunk(sink, &e->sample_spec, &e->channel_map, &e->memchunk, pass_volume ? &r : NULL, merged, sink_input_idx) < 0)
++    if (pa_play_memchunk(sink,
++                         &e->sample_spec, &e->channel_map,
++                         &e->memchunk,
++                         pass_volume ? &r : NULL,
++                         merged,
++                         PA_SINK_INPUT_NO_CREATE_ON_SUSPEND|PA_SINK_INPUT_KILL_ON_SUSPEND, sink_input_idx) < 0)
+         goto fail;
+ 
+     pa_proplist_free(merged);
+Index: pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478/src/pulsecore/core-util.c
+===================================================================
+--- pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478.orig/src/pulsecore/core-util.c	2010-01-17 18:54:20.000000000 -0500
++++ pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478/src/pulsecore/core-util.c	2010-09-18 08:44:23.000000000 -0400
+@@ -126,6 +126,9 @@
+ #define MSG_NOSIGNAL 0
+ #endif
+ 
++#define NEWLINE "\r\n"
++#define WHITESPACE "\n\r \t"
++
+ static pa_strlist *recorded_env = NULL;
+ 
+ #ifdef OS_IS_WIN32
+@@ -830,9 +833,6 @@
+     return pa_xstrndup(current, l);
+ }
+ 
+-/* What is interpreted as whitespace? */
+-#define WHITESPACE " \t\n"
+-
+ /* Split a string into words. Otherwise similar to pa_split(). */
+ char *pa_split_spaces(const char *c, const char **state) {
+     const char *current = *state ? *state : c;
+@@ -1189,7 +1189,27 @@
+ char* pa_strip_nl(char *s) {
+     pa_assert(s);
+ 
+-    s[strcspn(s, "\r\n")] = 0;
++    s[strcspn(s, NEWLINE)] = 0;
++    return s;
++}
++
++char *pa_strip(char *s) {
++    char *e, *l = NULL;
++
++    /* Drops trailing whitespace. Modifies the string in
++     * place. Returns pointer to first non-space character */
++
++    s += strspn(s, WHITESPACE);
++
++    for (e = s; *e; e++)
++        if (!strchr(WHITESPACE, *e))
++            l = e;
++
++    if (l)
++        *(l+1) = 0;
++    else
++        *s = 0;
++
+     return s;
+ }
+ 
+Index: pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478/src/pulsecore/core-util.h
+===================================================================
+--- pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478.orig/src/pulsecore/core-util.h	2010-01-17 18:54:20.000000000 -0500
++++ pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478/src/pulsecore/core-util.h	2010-09-18 08:44:02.000000000 -0400
+@@ -102,6 +102,7 @@
+ char *pa_split_spaces(const char *c, const char **state);
+ 
+ char *pa_strip_nl(char *s);
++char *pa_strip(char *s);
+ 
+ const char *pa_sig2str(int sig) PA_GCC_PURE;
+ 
+Index: pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478/src/pulsecore/dbus-util.c
+===================================================================
+--- pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478.orig/src/pulsecore/dbus-util.c	2010-01-17 18:54:20.000000000 -0500
++++ pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478/src/pulsecore/dbus-util.c	2010-09-18 08:44:02.000000000 -0400
+@@ -44,17 +44,16 @@
+ };
+ 
+ struct timeout_data {
+-    pa_dbus_wrap_connection *c;
++    pa_dbus_wrap_connection *connection;
+     DBusTimeout *timeout;
+ };
+ 
+ static void dispatch_cb(pa_mainloop_api *ea, pa_defer_event *ev, void *userdata) {
+     DBusConnection *conn = userdata;
+ 
+-    if (dbus_connection_dispatch(conn) == DBUS_DISPATCH_COMPLETE) {
++    if (dbus_connection_dispatch(conn) == DBUS_DISPATCH_COMPLETE)
+         /* no more data to process, disable the deferred */
+         ea->defer_enable(ev, 0);
+-    }
+ }
+ 
+ /* DBusDispatchStatusFunction callback for the pa mainloop */
+@@ -131,13 +130,17 @@
+     struct timeout_data *d = userdata;
+ 
+     pa_assert(d);
+-    pa_assert(d->c);
++    pa_assert(d->connection);
+ 
+     if (dbus_timeout_get_enabled(d->timeout)) {
+-        dbus_timeout_handle(d->timeout);
++        /* Restart it for the next scheduled time. We do this before
++         * calling dbus_timeout_handle() to make sure that the time
++         * event is still around. */
++        ea->time_restart(e, pa_timeval_rtstore(&tv,
++                                               pa_timeval_load(t) + dbus_timeout_get_interval(d->timeout) * PA_USEC_PER_MSEC,
++                                               d->connection->use_rtclock));
+ 
+-        /* restart it for the next scheduled time */
+-        ea->time_restart(e, pa_timeval_rtstore(&tv, pa_timeval_load(t) + dbus_timeout_get_interval(d->timeout) * PA_USEC_PER_MSEC, d->c->use_rtclock));
++        dbus_timeout_handle(d->timeout);
+     }
+ }
+ 
+@@ -207,7 +210,7 @@
+         return FALSE;
+ 
+     d = pa_xnew(struct timeout_data, 1);
+-    d->c = c;
++    d->connection = c;
+     d->timeout = timeout;
+     ev = c->mainloop->time_new(c->mainloop, pa_timeval_rtstore(&tv, pa_rtclock_now() + dbus_timeout_get_interval(timeout) * PA_USEC_PER_MSEC, c->use_rtclock), handle_time_event, d);
+     c->mainloop->time_set_destroy(ev, time_event_destroy_cb);
+@@ -236,15 +239,15 @@
+     struct timeval tv;
+ 
+     pa_assert(d);
+-    pa_assert(d->c);
++    pa_assert(d->connection);
+     pa_assert(timeout);
+ 
+     pa_assert_se(ev = dbus_timeout_get_data(timeout));
+ 
+-    if (dbus_timeout_get_enabled(timeout)) {
+-        d->c->mainloop->time_restart(ev, pa_timeval_rtstore(&tv, pa_rtclock_now() + dbus_timeout_get_interval(timeout) * PA_USEC_PER_MSEC, d->c->use_rtclock));
+-    } else
+-        d->c->mainloop->time_restart(ev, pa_timeval_rtstore(&tv, PA_USEC_INVALID, d->c->use_rtclock));
++    if (dbus_timeout_get_enabled(timeout))
++        d->connection->mainloop->time_restart(ev, pa_timeval_rtstore(&tv, pa_rtclock_now() + dbus_timeout_get_interval(timeout) * PA_USEC_PER_MSEC, d->connection->use_rtclock));
++    else
++        d->connection->mainloop->time_restart(ev, pa_timeval_rtstore(&tv, PA_USEC_INVALID, d->connection->use_rtclock));
+ }
+ 
+ static void wakeup_main(void *userdata) {
+Index: pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478/src/pulsecore/fdsem.c
+===================================================================
+--- pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478.orig/src/pulsecore/fdsem.c	2010-01-17 18:54:20.000000000 -0500
++++ pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478/src/pulsecore/fdsem.c	2010-09-18 08:44:02.000000000 -0400
+@@ -35,6 +35,7 @@
+ #include <pulsecore/thread.h>
+ #include <pulsecore/macro.h>
+ #include <pulsecore/core-util.h>
++#include <pulsecore/core-error.h>
+ #include <pulse/xmalloc.h>
+ 
+ #ifndef HAVE_PIPE
+@@ -159,7 +160,12 @@
+             uint64_t u;
+ 
+             if ((r = read(f->efd, &u, sizeof(u))) != sizeof(u)) {
+-                pa_assert(r < 0 && errno == EINTR);
++
++                if (r >= 0 || errno != EINTR) {
++                    pa_log_error("Invalid read from eventfd: %s", r < 0 ? pa_cstrerror(errno) : "EOF");
++                    pa_assert_not_reached();
++                }
++
+                 continue;
+             }
+             r = (ssize_t) u;
+@@ -167,7 +173,12 @@
+ #endif
+ 
+         if ((r = read(f->fds[0], &x, sizeof(x))) <= 0) {
+-            pa_assert(r < 0 && errno == EINTR);
++
++            if (r >= 0 || errno != EINTR) {
++                pa_log_error("Invalid read from pipe: %s", r < 0 ? pa_cstrerror(errno) : "EOF");
++                pa_assert_not_reached();
++            }
++
+             continue;
+         }
+ 
+@@ -192,14 +203,22 @@
+                     uint64_t u = 1;
+ 
+                     if ((r = write(f->efd, &u, sizeof(u))) != sizeof(u)) {
+-                        pa_assert(r < 0 && errno == EINTR);
++                        if (r >= 0 || errno != EINTR) {
++                            pa_log_error("Invalid read from pipe: %s", r < 0 ? pa_cstrerror(errno) : "EOF");
++                            pa_assert_not_reached();
++                        }
++
+                         continue;
+                     }
+                 } else
+ #endif
+ 
+                 if ((r = write(f->fds[1], &x, 1)) != 1) {
+-                    pa_assert(r < 0 && errno == EINTR);
++                    if (r >= 0 || errno != EINTR) {
++                        pa_log_error("Invalid read from pipe: %s", r < 0 ? pa_cstrerror(errno) : "EOF");
++                        pa_assert_not_reached();
++                    }
++
+                     continue;
+                 }
+ 
+@@ -228,7 +247,12 @@
+             uint64_t u;
+ 
+             if ((r = read(f->efd, &u, sizeof(u))) != sizeof(u)) {
+-                pa_assert(r < 0 && errno == EINTR);
++
++                if (r >= 0 || errno != EINTR) {
++                    pa_log_error("Invalid read from pipe: %s", r < 0 ? pa_cstrerror(errno) : "EOF");
++                    pa_assert_not_reached();
++                }
++
+                 continue;
+             }
+ 
+@@ -237,7 +261,12 @@
+ #endif
+ 
+         if ((r = read(f->fds[0], &x, sizeof(x))) <= 0) {
+-            pa_assert(r < 0 && errno == EINTR);
++
++            if (r >= 0 || errno != EINTR) {
++                pa_log_error("Invalid read from pipe: %s", r < 0 ? pa_cstrerror(errno) : "EOF");
++                pa_assert_not_reached();
++            }
++
+             continue;
+         }
+ 
+Index: pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478/src/pulsecore/lock-autospawn.c
+===================================================================
+--- pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478.orig/src/pulsecore/lock-autospawn.c	2010-01-17 18:54:20.000000000 -0500
++++ pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478/src/pulsecore/lock-autospawn.c	2010-09-18 08:44:02.000000000 -0400
+@@ -246,7 +246,7 @@
+ static int start_thread(void) {
+ 
+     if (!thread)
+-        if (!(thread = pa_thread_new(thread_func, NULL)))
++        if (!(thread = pa_thread_new("autospawn", thread_func, NULL)))
+             return -1;
+ 
+     return 0;
+Index: pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478/src/pulsecore/play-memblockq.c
+===================================================================
+--- pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478.orig/src/pulsecore/play-memblockq.c	2009-08-28 22:31:49.000000000 -0400
++++ pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478/src/pulsecore/play-memblockq.c	2010-09-18 08:44:02.000000000 -0400
+@@ -173,7 +173,8 @@
+         const pa_channel_map *map,
+         pa_memblockq *q,
+         pa_cvolume *volume,
+-        pa_proplist *p) {
++        pa_proplist *p,
++        pa_sink_input_flags_t flags) {
+ 
+     memblockq_stream *u = NULL;
+     pa_sink_input_new_data data;
+@@ -198,6 +199,7 @@
+     pa_sink_input_new_data_set_channel_map(&data, map);
+     pa_sink_input_new_data_set_volume(&data, volume);
+     pa_proplist_update(data.proplist, PA_UPDATE_REPLACE, p);
++    data.flags |= flags;
+ 
+     pa_sink_input_new(&u->sink_input, sink->core, &data);
+     pa_sink_input_new_data_done(&data);
+@@ -237,6 +239,7 @@
+         pa_memblockq *q,
+         pa_cvolume *volume,
+         pa_proplist *p,
++        pa_sink_input_flags_t flags,
+         uint32_t *sink_input_index) {
+ 
+     pa_sink_input *i;
+@@ -245,7 +248,7 @@
+     pa_assert(ss);
+     pa_assert(q);
+ 
+-    if (!(i = pa_memblockq_sink_input_new(sink, ss, map, q, volume, p)))
++    if (!(i = pa_memblockq_sink_input_new(sink, ss, map, q, volume, p, flags)))
+         return -1;
+ 
+     pa_sink_input_put(i);
+Index: pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478/src/pulsecore/play-memblockq.h
+===================================================================
+--- pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478.orig/src/pulsecore/play-memblockq.h	2009-04-03 17:09:39.000000000 -0400
++++ pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478/src/pulsecore/play-memblockq.h	2010-09-18 08:44:02.000000000 -0400
+@@ -31,17 +31,19 @@
+         const pa_channel_map *map,
+         pa_memblockq *q,
+         pa_cvolume *volume,
+-        pa_proplist *p);
++        pa_proplist *p,
++        pa_sink_input_flags_t flags);
+ 
+ void pa_memblockq_sink_input_set_queue(pa_sink_input *i, pa_memblockq *q);
+ 
+ int pa_play_memblockq(
+-    pa_sink *sink,
+-    const pa_sample_spec *ss,
+-    const pa_channel_map *map,
+-    pa_memblockq *q,
+-    pa_cvolume *cvolume,
+-    pa_proplist *p,
+-    uint32_t *sink_input_index);
++        pa_sink *sink,
++        const pa_sample_spec *ss,
++        const pa_channel_map *map,
++        pa_memblockq *q,
++        pa_cvolume *cvolume,
++        pa_proplist *p,
++        pa_sink_input_flags_t flags,
++        uint32_t *sink_input_index);
+ 
+ #endif
+Index: pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478/src/pulsecore/play-memchunk.c
+===================================================================
+--- pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478.orig/src/pulsecore/play-memchunk.c	2010-01-17 18:54:20.000000000 -0500
++++ pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478/src/pulsecore/play-memchunk.c	2010-09-18 08:44:02.000000000 -0400
+@@ -43,6 +43,7 @@
+         const pa_memchunk *chunk,
+         pa_cvolume *volume,
+         pa_proplist *p,
++        pa_sink_input_flags_t flags,
+         uint32_t *sink_input_index) {
+ 
+     pa_memblockq *q;
+@@ -59,7 +60,7 @@
+ 
+     pa_assert_se(pa_memblockq_push(q, chunk) >= 0);
+ 
+-    if ((r = pa_play_memblockq(sink, ss, map, q, volume, p, sink_input_index)) < 0) {
++    if ((r = pa_play_memblockq(sink, ss, map, q, volume, p, flags, sink_input_index)) < 0) {
+         pa_memblockq_free(q);
+         return r;
+     }
+Index: pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478/src/pulsecore/play-memchunk.h
+===================================================================
+--- pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478.orig/src/pulsecore/play-memchunk.h	2009-04-03 17:09:39.000000000 -0400
++++ pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478/src/pulsecore/play-memchunk.h	2010-09-18 08:44:02.000000000 -0400
+@@ -26,12 +26,13 @@
+ #include <pulsecore/memchunk.h>
+ 
+ int pa_play_memchunk(
+-    pa_sink *sink,
+-    const pa_sample_spec *ss,
+-    const pa_channel_map *map,
+-    const pa_memchunk *chunk,
+-    pa_cvolume *cvolume,
+-    pa_proplist *p,
+-    uint32_t *sink_input_index);
++        pa_sink *sink,
++        const pa_sample_spec *ss,
++        const pa_channel_map *map,
++        const pa_memchunk *chunk,
++        pa_cvolume *cvolume,
++        pa_proplist *p,
++        pa_sink_input_flags_t flags,
++        uint32_t *sink_input_index);
+ 
+ #endif
+Index: pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478/src/pulsecore/protocol-esound.c
+===================================================================
+--- pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478.orig/src/pulsecore/protocol-esound.c	2010-01-17 18:54:20.000000000 -0500
++++ pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478/src/pulsecore/protocol-esound.c	2010-09-18 08:44:02.000000000 -0400
+@@ -462,7 +462,7 @@
+ 
+     c->protocol->n_player++;
+ 
+-    pa_atomic_store(&c->playback.missing, (int) pa_memblockq_missing(c->input_memblockq));
++    pa_atomic_store(&c->playback.missing, (int) pa_memblockq_pop_missing(c->input_memblockq));
+ 
+     pa_sink_input_put(c->sink_input);
+ 
+Index: pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478/src/pulsecore/protocol-native.c
+===================================================================
+--- pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478.orig/src/pulsecore/protocol-native.c	2010-01-17 21:00:16.000000000 -0500
++++ pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478/src/pulsecore/protocol-native.c	2010-09-18 08:44:02.000000000 -0400
+@@ -858,6 +858,18 @@
+ 
+     pa_assert(s);
+ 
++    /* pa_log("Client requested: maxlength=%li bytes tlength=%li bytes minreq=%li bytes prebuf=%li bytes", */
++    /*        (long) s->buffer_attr.maxlength, */
++    /*        (long) s->buffer_attr.tlength, */
++    /*        (long) s->buffer_attr.minreq, */
++    /*        (long) s->buffer_attr.prebuf); */
++
++    /* pa_log("Client requested: maxlength=%lu ms tlength=%lu ms minreq=%lu ms prebuf=%lu ms", */
++    /*        (unsigned long) (pa_bytes_to_usec(s->buffer_attr.maxlength, &s->sink_input->sample_spec) / PA_USEC_PER_MSEC), */
++    /*        (unsigned long) (pa_bytes_to_usec(s->buffer_attr.tlength, &s->sink_input->sample_spec) / PA_USEC_PER_MSEC), */
++    /*        (unsigned long) (pa_bytes_to_usec(s->buffer_attr.minreq, &s->sink_input->sample_spec) / PA_USEC_PER_MSEC), */
++    /*        (unsigned long) (pa_bytes_to_usec(s->buffer_attr.prebuf, &s->sink_input->sample_spec) / PA_USEC_PER_MSEC)); */
++
+     /* This function will be called from the main thread, before as
+      * well as after the sink input has been activated using
+      * pa_sink_input_put()! That means it may not touch any
+@@ -984,6 +996,12 @@
+     if (s->buffer_attr.prebuf == (uint32_t) -1 ||
+         s->buffer_attr.prebuf > max_prebuf)
+         s->buffer_attr.prebuf = max_prebuf;
++
++    /* pa_log("Client accepted: maxlength=%lu ms tlength=%lu ms minreq=%lu ms prebuf=%lu ms", */
++    /*        (unsigned long) (pa_bytes_to_usec(s->buffer_attr.maxlength, &s->sink_input->sample_spec) / PA_USEC_PER_MSEC), */
++    /*        (unsigned long) (pa_bytes_to_usec(s->buffer_attr.tlength, &s->sink_input->sample_spec) / PA_USEC_PER_MSEC), */
++    /*        (unsigned long) (pa_bytes_to_usec(s->buffer_attr.minreq, &s->sink_input->sample_spec) / PA_USEC_PER_MSEC), */
++    /*        (unsigned long) (pa_bytes_to_usec(s->buffer_attr.prebuf, &s->sink_input->sample_spec) / PA_USEC_PER_MSEC)); */
+ }
+ 
+ /* Called from main context */
+Index: pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478/src/pulsecore/protocol-simple.c
+===================================================================
+--- pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478.orig/src/pulsecore/protocol-simple.c	2010-01-17 18:54:20.000000000 -0500
++++ pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478/src/pulsecore/protocol-simple.c	2010-09-18 08:44:02.000000000 -0400
+@@ -574,7 +574,7 @@
+ 
+         pa_iochannel_socket_set_rcvbuf(io, l);
+ 
+-        pa_atomic_store(&c->playback.missing, (int) pa_memblockq_missing(c->input_memblockq));
++        pa_atomic_store(&c->playback.missing, (int) pa_memblockq_pop_missing(c->input_memblockq));
+ 
+         pa_sink_input_put(c->sink_input);
+     }
+Index: pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478/src/pulsecore/shm.c
+===================================================================
+--- pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478.orig/src/pulsecore/shm.c	2009-08-14 14:07:07.000000000 -0400
++++ pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478/src/pulsecore/shm.c	2010-09-18 08:44:02.000000000 -0400
+@@ -286,7 +286,7 @@
+     segment_name(fn, sizeof(fn), m->id = id);
+ 
+     if ((fd = shm_open(fn, O_RDONLY, 0)) < 0) {
+-        if (errno != EACCES)
++        if (errno != EACCES && errno != ENOENT)
+             pa_log("shm_open() failed: %s", pa_cstrerror(errno));
+         goto fail;
+     }
+Index: pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478/src/pulsecore/sink.c
+===================================================================
+--- pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478.orig/src/pulsecore/sink.c	2010-01-17 18:54:20.000000000 -0500
++++ pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478/src/pulsecore/sink.c	2010-09-18 08:44:02.000000000 -0400
+@@ -1162,6 +1162,46 @@
+     return usec;
+ }
+ 
++static pa_cvolume* cvolume_remap_minimal_impact(
++        pa_cvolume *v,
++        const pa_cvolume *template,
++        const pa_channel_map *from,
++        const pa_channel_map *to) {
++
++    pa_cvolume t;
++
++    pa_assert(v);
++    pa_assert(template);
++    pa_assert(from);
++    pa_assert(to);
++
++    pa_return_val_if_fail(pa_cvolume_compatible_with_channel_map(v, from), NULL);
++    pa_return_val_if_fail(pa_cvolume_compatible_with_channel_map(template, to), NULL);
++
++    /* Much like pa_cvolume_remap(), but tries to minimize impact when
++     * mapping from sink input to sink volumes:
++     *
++     * If template is a possible remapping from v it is used instead
++     * of remapping anew.
++     *
++     * If the channel maps don't match we set an all-channel volume on
++     * the sink to ensure that changing a volume on one stream has no
++     * effect that cannot be compensated for in another stream that
++     * does not have the same channel map as the sink. */
++
++    if (pa_channel_map_equal(from, to))
++        return v;
++
++    t = *template;
++    if (pa_cvolume_equal(pa_cvolume_remap(&t, to, from), v)) {
++        *v = *template;
++        return v;
++    }
++
++    pa_cvolume_set(v, to->channels, pa_cvolume_max(v));
++    return v;
++}
++
+ /* Called from main context */
+ static void compute_reference_ratios(pa_sink *s) {
+     uint32_t idx;
+@@ -1289,7 +1329,7 @@
+         pa_cvolume remapped;
+ 
+         remapped = i->volume;
+-        pa_cvolume_remap(&remapped, &i->channel_map, &s->channel_map);
++        cvolume_remap_minimal_impact(&remapped, &s->real_volume, &i->channel_map, &s->channel_map);
+         pa_cvolume_merge(&s->real_volume, &s->real_volume, &remapped);
+     }
+ 
+Index: pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478/src/pulsecore/sink-input.c
+===================================================================
+--- pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478.orig/src/pulsecore/sink-input.c	2010-01-17 21:00:16.000000000 -0500
++++ pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478/src/pulsecore/sink-input.c	2010-09-18 08:44:02.000000000 -0400
+@@ -1086,7 +1086,7 @@
+     if (p)
+         pa_proplist_update(i->proplist, mode, p);
+ 
+-    if (PA_SINK_IS_LINKED(i->state)) {
++    if (PA_SINK_INPUT_IS_LINKED(i->state)) {
+         pa_hook_fire(&i->core->hooks[PA_CORE_HOOK_SINK_INPUT_PROPLIST_CHANGED], i);
+         pa_subscription_post(i->core, PA_SUBSCRIPTION_EVENT_SINK_INPUT|PA_SUBSCRIPTION_EVENT_CHANGE, i->index);
+     }
+Index: pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478/src/pulsecore/socket-client.c
+===================================================================
+--- pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478.orig/src/pulsecore/socket-client.c	2010-01-17 18:54:20.000000000 -0500
++++ pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478/src/pulsecore/socket-client.c	2010-09-18 08:44:02.000000000 -0400
+@@ -389,7 +389,8 @@
+         goto fail;
+ 
+     if (res->ai_addr)
+-        sockaddr_prepare(c, res->ai_addr, res->ai_addrlen);
++        if (sockaddr_prepare(c, res->ai_addr, res->ai_addrlen) < 0)
++            goto fail;
+ 
+     asyncns_freeaddrinfo(res);
+ 
+Index: pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478/src/pulsecore/thread.h
+===================================================================
+--- pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478.orig/src/pulsecore/thread.h	2010-01-17 18:54:20.000000000 -0500
++++ pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478/src/pulsecore/thread.h	2010-09-18 08:44:02.000000000 -0400
+@@ -35,7 +35,7 @@
+ 
+ typedef void (*pa_thread_func_t) (void *userdata);
+ 
+-pa_thread* pa_thread_new(pa_thread_func_t thread_func, void *userdata);
++pa_thread* pa_thread_new(const char *name, pa_thread_func_t thread_func, void *userdata);
+ void pa_thread_free(pa_thread *t);
+ int pa_thread_join(pa_thread *t);
+ int pa_thread_is_running(pa_thread *t);
+@@ -45,6 +45,9 @@
+ void* pa_thread_get_data(pa_thread *t);
+ void pa_thread_set_data(pa_thread *t, void *userdata);
+ 
++const char *pa_thread_get_name(pa_thread *t);
++void pa_thread_set_name(pa_thread *t, const char *name);
++
+ typedef struct pa_tls pa_tls;
+ 
+ pa_tls* pa_tls_new(pa_free_cb_t free_cb);
+Index: pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478/src/pulsecore/thread-posix.c
+===================================================================
+--- pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478.orig/src/pulsecore/thread-posix.c	2010-01-17 18:54:20.000000000 -0500
++++ pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478/src/pulsecore/thread-posix.c	2010-09-18 08:44:02.000000000 -0400
+@@ -28,6 +28,10 @@
+ #include <sched.h>
+ #include <errno.h>
+ 
++#ifdef __linux__
++#include <sys/prctl.h>
++#endif
++
+ #include <pulse/xmalloc.h>
+ #include <pulsecore/mutex.h>
+ #include <pulsecore/once.h>
+@@ -42,6 +46,7 @@
+     void *userdata;
+     pa_atomic_t running;
+     pa_bool_t joined;
++    char *name;
+ };
+ 
+ struct pa_tls {
+@@ -53,9 +58,11 @@
+ 
+     pa_assert(t);
+ 
+-    if (!t->thread_func)
++    if (!t->thread_func) {
+         /* This is a foreign thread, we need to free the struct */
++        pa_xfree(t->name);
+         pa_xfree(t);
++    }
+ }
+ 
+ PA_STATIC_TLS_DECLARE(current_thread, thread_free_cb);
+@@ -64,6 +71,10 @@
+     pa_thread *t = userdata;
+     pa_assert(t);
+ 
++#ifdef __linux__
++    prctl(PR_SET_NAME, t->name);
++#endif
++
+     t->id = pthread_self();
+ 
+     PA_STATIC_TLS_SET(current_thread, t);
+@@ -75,12 +86,13 @@
+     return NULL;
+ }
+ 
+-pa_thread* pa_thread_new(pa_thread_func_t thread_func, void *userdata) {
++pa_thread* pa_thread_new(const char *name, pa_thread_func_t thread_func, void *userdata) {
+     pa_thread *t;
+ 
+     pa_assert(thread_func);
+ 
+     t = pa_xnew0(pa_thread, 1);
++    t->name = pa_xstrdup(name);
+     t->thread_func = thread_func;
+     t->userdata = userdata;
+ 
+@@ -110,6 +122,8 @@
+     pa_assert(t);
+ 
+     pa_thread_join(t);
++
++    pa_xfree(t->name);
+     pa_xfree(t);
+ }
+ 
+@@ -155,6 +169,36 @@
+     t->userdata = userdata;
+ }
+ 
++void pa_thread_set_name(pa_thread *t, const char *name) {
++    pa_assert(t);
++
++    pa_xfree(t->name);
++    t->name = pa_xstrdup(name);
++
++#ifdef __linux__
++    prctl(PR_SET_NAME, name);
++#endif
++}
++
++const char *pa_thread_get_name(pa_thread *t) {
++    pa_assert(t);
++
++#ifdef __linux__
++    if (!t->name) {
++        t->name = pa_xmalloc(17);
++
++        if (prctl(PR_GET_NAME, t->name) >= 0)
++            t->name[16] = 0;
++        else {
++            pa_xfree(t->name);
++            t->name = NULL;
++        }
++    }
++#endif
++
++    return t->name;
++}
++
+ void pa_thread_yield(void) {
+ #ifdef HAVE_PTHREAD_YIELD
+     pthread_yield();
+Index: pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478/src/pulsecore/time-smoother.c
+===================================================================
+--- pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478.orig/src/pulsecore/time-smoother.c	2010-01-17 18:54:20.000000000 -0500
++++ pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478/src/pulsecore/time-smoother.c	2010-09-18 08:44:02.000000000 -0400
+@@ -313,10 +313,8 @@
+ 
+         calc_abc(s);
+ 
+-        tx = (double) x;
+-
+         /* Move to origin */
+-        tx -= (double) s->ex;
++        tx = (double) (x - s->ex);
+ 
+         /* Horner scheme */
+         ty = (tx * (s->c + tx * (s->b + tx * s->a)));
+Index: pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478/src/pulsecore/x11prop.c
+===================================================================
+--- pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478.orig/src/pulsecore/x11prop.c	2010-01-17 18:54:20.000000000 -0500
++++ pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478/src/pulsecore/x11prop.c	2010-09-18 09:04:42.000000000 -0400
+@@ -25,45 +25,104 @@
+ 
+ #include <string.h>
+ 
+-#include <X11/Xlib.h>
+-#include <X11/Xatom.h>
+-
+ #include "x11prop.h"
+ 
+-void pa_x11_set_prop(Display *d, const char *name, const char *data) {
+-    Atom a = XInternAtom(d, name, False);
+-    XChangeProperty(d, RootWindow(d, 0), a, XA_STRING, 8, PropModeReplace, (const unsigned char*) data, (int) (strlen(data)+1));
+-}
++#include <pulsecore/macro.h>
++
++#include <xcb/xproto.h>
++#include <xcb/xcb_atom.h>
++
++#define PA_XCB_FORMAT 8
+ 
+-void pa_x11_del_prop(Display *d, const char *name) {
+-    Atom a = XInternAtom(d, name, False);
+-    XDeleteProperty(d, RootWindow(d, 0), a);
++static xcb_screen_t *screen_of_display(xcb_connection_t *xcb, int screen)
++{
++    const xcb_setup_t *s;
++    xcb_screen_iterator_t iter;
++
++    if ((s = xcb_get_setup(xcb))) {
++        iter = xcb_setup_roots_iterator(s);
++        for (; iter.rem; --screen, xcb_screen_next(&iter))
++            if (0 == screen)
++                return iter.data;
++    }
++    return NULL;
+ }
+ 
+-char* pa_x11_get_prop(Display *d, const char *name, char *p, size_t l) {
+-    Atom actual_type;
+-    int actual_format;
+-    unsigned long nitems;
+-    unsigned long nbytes_after;
+-    unsigned char *prop = NULL;
+-    char *ret = NULL;
++void pa_x11_set_prop(xcb_connection_t *xcb, int screen, const char *name, const char *data) {
++    xcb_screen_t *xs;
++    xcb_atom_t a;
++
++    pa_assert(xcb);
++    pa_assert(name);
++    pa_assert(data);
++
++    if ((xs = screen_of_display(xcb, screen))) {
++        a = xcb_atom_get(xcb, name);
++        xcb_change_property(xcb, XCB_PROP_MODE_REPLACE, xs->root, a, STRING, PA_XCB_FORMAT, (int) strlen(data), (const void*) data);
++    }
++}
+ 
+-    Atom a = XInternAtom(d, name, False);
+-    if (XGetWindowProperty(d, RootWindow(d, 0), a, 0, (long) ((l+2)/4), False, XA_STRING, &actual_type, &actual_format, &nitems, &nbytes_after, &prop) != Success)
+-        goto finish;
++void pa_x11_del_prop(xcb_connection_t *xcb, int screen, const char *name) {
++    xcb_screen_t *xs;
++    xcb_atom_t a;
++
++    pa_assert(xcb);
++    pa_assert(name);
++
++    if ((xs = screen_of_display(xcb, screen))) {
++        a = xcb_atom_get(xcb, name);
++        xcb_delete_property(xcb, xs->root, a);
++    }
++}
+ 
+-    if (actual_type != XA_STRING)
+-        goto finish;
++char* pa_x11_get_prop(xcb_connection_t *xcb, int screen, const char *name, char *p, size_t l) {
++    char *ret = NULL;
++    int len;
++    xcb_get_property_cookie_t req;
++    xcb_get_property_reply_t* prop = NULL;
++    xcb_screen_t *xs;
++    xcb_atom_t a;
++
++    pa_assert(xcb);
++    pa_assert(name);
++    pa_assert(p);
++
++    xs = screen_of_display(xcb, screen);
++    /*
++     * Also try and get the settings from the first screen.
++     * This allows for e.g. a Media Center to run on screen 1 (e.g. HDMI) and have
++     * different defaults (e.g. prefer the HDMI sink) than the primary screen 0
++     * which uses the Internal Audio sink.
++     */
++    if (!xs && 0 != screen)
++        xs = screen_of_display(xcb, 0);
++
++    if (xs) {
++        a = xcb_atom_get(xcb, name);
++
++        req = xcb_get_property(xcb, 0, xs->root, a, STRING, 0, (uint32_t)(l-1));
++        prop = xcb_get_property_reply(xcb, req, NULL);
++
++        if (!prop)
++            goto finish;
++
++        if (PA_XCB_FORMAT != prop->format)
++            goto finish;
++
++        len = xcb_get_property_value_length(prop);
++        if (len < 1 || len >= (int)l)
++            goto finish;
+ 
+-    memcpy(p, prop, nitems);
+-    p[nitems] = 0;
++        memcpy(p, xcb_get_property_value(prop), len);
++        p[len] = 0;
+ 
+-    ret = p;
++        ret = p;
++    }
+ 
+ finish:
+ 
+     if (prop)
+-        XFree(prop);
++        free(prop);
+ 
+     return ret;
+ }
+Index: pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478/src/pulsecore/x11prop.h
+===================================================================
+--- pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478.orig/src/pulsecore/x11prop.h	2009-04-03 17:09:39.000000000 -0400
++++ pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478/src/pulsecore/x11prop.h	2010-09-18 08:56:44.000000000 -0400
+@@ -5,6 +5,7 @@
+   This file is part of PulseAudio.
+ 
+   Copyright 2004-2006 Lennart Poettering
++  Copyright 2010 Colin Guthrie
+ 
+   PulseAudio is free software; you can redistribute it and/or modify
+   it under the terms of the GNU Lesser General Public License as published
+@@ -24,10 +25,10 @@
+ 
+ #include <sys/types.h>
+ 
+-#include <X11/Xlib.h>
++#include <xcb/xcb.h>
+ 
+-void pa_x11_set_prop(Display *d, const char *name, const char *data);
+-void pa_x11_del_prop(Display *d, const char *name);
+-char* pa_x11_get_prop(Display *d, const char *name, char *p, size_t l);
++void pa_x11_set_prop(xcb_connection_t *xcb, int screen, const char *name, const char *data);
++void pa_x11_del_prop(xcb_connection_t *xcb, int screen, const char *name);
++char* pa_x11_get_prop(xcb_connection_t *xcb, int screen, const char *name, char *p, size_t l);
+ 
+ #endif
+Index: pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478/src/pulsecore/x11wrap.c
+===================================================================
+--- pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478.orig/src/pulsecore/x11wrap.c	2009-04-03 17:09:39.000000000 -0400
++++ pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478/src/pulsecore/x11wrap.c	2010-09-18 08:44:02.000000000 -0400
+@@ -259,6 +259,10 @@
+     return w->display;
+ }
+ 
++xcb_connection_t *pa_x11_wrapper_get_xcb_connection(pa_x11_wrapper *w) {
++    return XGetXCBConnection(pa_x11_wrapper_get_display(w));
++}
++
+ void pa_x11_wrapper_kill(pa_x11_wrapper *w) {
+     pa_x11_client *c, *n;
+ 
+Index: pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478/src/pulsecore/x11wrap.h
+===================================================================
+--- pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478.orig/src/pulsecore/x11wrap.h	2009-04-03 17:09:39.000000000 -0400
++++ pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478/src/pulsecore/x11wrap.h	2010-09-18 08:44:02.000000000 -0400
+@@ -23,6 +23,7 @@
+ ***/
+ 
+ #include <X11/Xlib.h>
++#include <X11/Xlib-xcb.h>
+ 
+ #include <pulsecore/core.h>
+ 
+@@ -46,6 +47,9 @@
+ /* Return the X11 display object for this connection */
+ Display *pa_x11_wrapper_get_display(pa_x11_wrapper *w);
+ 
++/* Return the XCB connection object for this connection */
++xcb_connection_t *pa_x11_wrapper_get_xcb_connection(pa_x11_wrapper *w);
++
+ /* Kill the connection to the X11 display */
+ void pa_x11_wrapper_kill(pa_x11_wrapper *w);
+ 
+Index: pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478/src/tests/alsa-time-test.c
+===================================================================
+--- pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478.orig/src/tests/alsa-time-test.c	2009-04-13 20:09:20.000000000 -0400
++++ pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478/src/tests/alsa-time-test.c	2010-09-18 08:44:02.000000000 -0400
+@@ -12,7 +12,7 @@
+ 
+ int main(int argc, char *argv[]) {
+     const char *dev;
+-    int r;
++    int r, cap;
+     snd_pcm_hw_params_t *hwparams;
+     snd_pcm_sw_params_t *swparams;
+     snd_pcm_status_t *status;
+@@ -38,8 +38,12 @@
+     start_us = timespec_us(&start);
+ 
+     dev = argc > 1 ? argv[1] : "front:AudioPCI";
++    cap = argc > 2 ? atoi(argv[2]) : 0;
+ 
+-    r = snd_pcm_open(&pcm, dev, SND_PCM_STREAM_PLAYBACK, 0);
++    if (cap == 0)
++      r = snd_pcm_open(&pcm, dev, SND_PCM_STREAM_PLAYBACK, 0);
++    else
++      r = snd_pcm_open(&pcm, dev, SND_PCM_STREAM_CAPTURE, 0);
+     assert(r == 0);
+ 
+     r = snd_pcm_hw_params_any(pcm, hwparams);
+@@ -78,7 +82,10 @@
+     r = snd_pcm_sw_params_current(pcm, swparams);
+     assert(r == 0);
+ 
+-    r = snd_pcm_sw_params_set_avail_min(pcm, swparams, 1);
++    if (cap == 0)
++      r = snd_pcm_sw_params_set_avail_min(pcm, swparams, 1);
++    else
++      r = snd_pcm_sw_params_set_avail_min(pcm, swparams, 0);
+     assert(r == 0);
+ 
+     r = snd_pcm_sw_params_set_period_event(pcm, swparams, 0);
+@@ -117,13 +124,19 @@
+     r = snd_pcm_poll_descriptors(pcm, pollfds, n_pollfd);
+     assert(r == n_pollfd);
+ 
++    if (cap) {
++      r = snd_pcm_start(pcm);
++      assert(r == 0);
++    }
++
+     for (;;) {
+         snd_pcm_sframes_t avail, delay;
+         struct timespec now, timestamp;
+         unsigned short revents;
+-        int written = 0;
++        int handled = 0;
+         uint64_t now_us, timestamp_us;
+         snd_pcm_state_t state;
++        unsigned long long pos;
+ 
+         r = poll(pollfds, n_pollfd, 0);
+         assert(r >= 0);
+@@ -131,7 +144,10 @@
+         r = snd_pcm_poll_descriptors_revents(pcm, pollfds, n_pollfd, &revents);
+         assert(r == 0);
+ 
+-        assert((revents & ~POLLOUT) == 0);
++        if (cap == 0)
++          assert((revents & ~POLLOUT) == 0);
++        else
++          assert((revents & ~POLLIN) == 0);
+ 
+         avail = snd_pcm_avail(pcm);
+         assert(avail >= 0);
+@@ -152,18 +168,22 @@
+ 
+         assert(!revents || avail > 0);
+ 
+-        if (avail) {
++        if ((!cap && avail) || (cap && (unsigned)avail >= buffer_size)) {
+             snd_pcm_sframes_t sframes;
+-            static const uint16_t samples[2] = { 0, 0 };
++            static const uint16_t psamples[2] = { 0, 0 };
++            uint16_t csamples[2];
+ 
+-            sframes = snd_pcm_writei(pcm, samples, 1);
++            if (cap == 0)
++              sframes = snd_pcm_writei(pcm, psamples, 1);
++            else
++              sframes = snd_pcm_readi(pcm, csamples, 1);
+             assert(sframes == 1);
+ 
+-            written = 1;
++            handled = 1;
+             sample_count++;
+         }
+ 
+-        if (!written &&
++        if (!handled &&
+             memcmp(&timestamp, &last_timestamp, sizeof(timestamp)) == 0 &&
+             avail == last_avail &&
+             delay == last_delay) {
+@@ -174,19 +194,26 @@
+         now_us = timespec_us(&now);
+         timestamp_us = timespec_us(&timestamp);
+ 
+-        printf("%llu\t%llu\t%llu\t%li\t%li\t%i\t%i\t%i\n",
++        if (cap == 0)
++            pos = (unsigned long long) ((sample_count - handled - delay) * 1000000LU / 44100);
++        else
++            pos = (unsigned long long) ((sample_count - handled + delay) * 1000000LU / 44100);
++
++        printf("%llu\t%llu\t%llu\t%llu\t%li\t%li\t%i\t%i\t%i\n",
+                (unsigned long long) (now_us - start_us),
+                (unsigned long long) (timestamp_us ? timestamp_us - start_us : 0),
+-               (unsigned long long) ((sample_count - 1 - delay) * 1000000LU / 44100),
++               pos,
++               (unsigned long long) sample_count,
+                (signed long) avail,
+                (signed long) delay,
+                revents,
+-               written,
++               handled,
+                state);
+ 
+-        /** When this assert is hit, most likely something bad
+-         * happened, i.e. the avail jumped suddenly. */
+-        assert((unsigned) avail <= buffer_size);
++        if (cap == 0)
++          /** When this assert is hit, most likely something bad
++           * happened, i.e. the avail jumped suddenly. */
++          assert((unsigned) avail <= buffer_size);
+ 
+         last_avail = avail;
+         last_delay = delay;
+Index: pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478/src/tests/asyncmsgq-test.c
+===================================================================
+--- pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478.orig/src/tests/asyncmsgq-test.c	2009-04-03 17:09:39.000000000 -0400
++++ pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478/src/tests/asyncmsgq-test.c	2010-09-18 08:44:02.000000000 -0400
+@@ -80,7 +80,7 @@
+ 
+     pa_assert_se(q = pa_asyncmsgq_new(0));
+ 
+-    pa_assert_se(t = pa_thread_new(the_thread, q));
++    pa_assert_se(t = pa_thread_new("test", the_thread, q));
+ 
+     printf("Operation A post\n");
+     pa_asyncmsgq_post(q, NULL, OPERATION_A, NULL, 0, NULL, NULL);
+Index: pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478/src/tests/asyncq-test.c
+===================================================================
+--- pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478.orig/src/tests/asyncq-test.c	2009-04-03 17:09:39.000000000 -0400
++++ pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478/src/tests/asyncq-test.c	2010-09-18 08:44:02.000000000 -0400
+@@ -73,8 +73,8 @@
+ 
+     pa_assert_se(q = pa_asyncq_new(0));
+ 
+-    pa_assert_se(t1 = pa_thread_new(producer, q));
+-    pa_assert_se(t2 = pa_thread_new(consumer, q));
++    pa_assert_se(t1 = pa_thread_new("producer", producer, q));
++    pa_assert_se(t2 = pa_thread_new("consumer", consumer, q));
+ 
+     pa_thread_free(t1);
+     pa_thread_free(t2);
+Index: pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478/src/tests/flist-test.c
+===================================================================
+--- pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478.orig/src/tests/flist-test.c	2009-04-03 17:09:39.000000000 -0400
++++ pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478/src/tests/flist-test.c	2010-09-18 08:44:02.000000000 -0400
+@@ -87,7 +87,7 @@
+     flist = pa_flist_new(0);
+ 
+     for (i = 0; i < THREADS_MAX; i++) {
+-        threads[i] = pa_thread_new(thread_func, pa_sprintf_malloc("Thread #%i", i+1));
++        threads[i] = pa_thread_new("test", thread_func, pa_sprintf_malloc("Thread #%i", i+1));
+         assert(threads[i]);
+     }
+ 
+Index: pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478/src/tests/lock-autospawn-test.c
+===================================================================
+--- pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478.orig/src/tests/lock-autospawn-test.c	2010-01-17 18:54:20.000000000 -0500
++++ pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478/src/tests/lock-autospawn-test.c	2010-09-18 08:44:02.000000000 -0400
+@@ -88,10 +88,10 @@
+ int main(int argc, char**argv) {
+     pa_thread *a, *b, *c, *d;
+ 
+-    pa_assert_se((a = pa_thread_new(thread_func, PA_INT_TO_PTR(1))));
+-    pa_assert_se((b = pa_thread_new(thread_func2, PA_INT_TO_PTR(2))));
+-    pa_assert_se((c = pa_thread_new(thread_func2, PA_INT_TO_PTR(3))));
+-    pa_assert_se((d = pa_thread_new(thread_func, PA_INT_TO_PTR(4))));
++    pa_assert_se((a = pa_thread_new("test1", thread_func, PA_INT_TO_PTR(1))));
++    pa_assert_se((b = pa_thread_new("test2", thread_func2, PA_INT_TO_PTR(2))));
++    pa_assert_se((c = pa_thread_new("test3", thread_func2, PA_INT_TO_PTR(3))));
++    pa_assert_se((d = pa_thread_new("test4", thread_func, PA_INT_TO_PTR(4))));
+ 
+     pa_thread_join(a);
+     pa_thread_join(b);
+Index: pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478/src/tests/thread-test.c
+===================================================================
+--- pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478.orig/src/tests/thread-test.c	2009-04-03 17:09:39.000000000 -0400
++++ pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478/src/tests/thread-test.c	2010-09-18 08:44:02.000000000 -0400
+@@ -102,7 +102,7 @@
+     tls = pa_tls_new(pa_xfree);
+ 
+     for (i = 0; i < THREADS_MAX; i++) {
+-        t[i] = pa_thread_new(thread_func, pa_sprintf_malloc("Thread #%i", i+1));
++        t[i] = pa_thread_new("test", thread_func, pa_sprintf_malloc("Thread #%i", i+1));
+         assert(t[i]);
+     }
+ 
+Index: pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478/src/utils/pacat.c
+===================================================================
+--- pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478.orig/src/utils/pacat.c	2010-01-17 18:54:20.000000000 -0500
++++ pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478/src/utils/pacat.c	2010-09-18 08:44:02.000000000 -0400
+@@ -195,28 +195,41 @@
+ 
+         pa_assert(sndfile);
+ 
+-        if (pa_stream_begin_write(s, &data, &length) < 0) {
+-            pa_log(_("pa_stream_begin_write() failed: %s"), pa_strerror(pa_context_errno(context)));
+-            quit(1);
+-            return;
+-        }
++        for (;;) {
++            size_t data_length = length;
+ 
+-        if (readf_function) {
+-            size_t k = pa_frame_size(&sample_spec);
++            if (pa_stream_begin_write(s, &data, &data_length) < 0) {
++                pa_log(_("pa_stream_begin_write() failed: %s"), pa_strerror(pa_context_errno(context)));
++                quit(1);
++                return;
++            }
+ 
+-            if ((bytes = readf_function(sndfile, data, (sf_count_t) (length/k))) > 0)
+-                bytes *= (sf_count_t) k;
++            if (readf_function) {
++                size_t k = pa_frame_size(&sample_spec);
+ 
+-        } else
+-            bytes = sf_read_raw(sndfile, data, (sf_count_t) length);
++                if ((bytes = readf_function(sndfile, data, (sf_count_t) (data_length/k))) > 0)
++                    bytes *= (sf_count_t) k;
+ 
+-        if (bytes > 0)
+-            pa_stream_write(s, data, (size_t) bytes, NULL, 0, PA_SEEK_RELATIVE);
+-        else
+-            pa_stream_cancel_write(s);
++            } else
++                bytes = sf_read_raw(sndfile, data, (sf_count_t) data_length);
+ 
+-        if (bytes < (sf_count_t) length)
+-            start_drain();
++            if (bytes > 0)
++                pa_stream_write(s, data, (size_t) bytes, NULL, 0, PA_SEEK_RELATIVE);
++            else
++                pa_stream_cancel_write(s);
++
++            /* EOF? */
++            if (bytes < (sf_count_t) data_length) {
++                start_drain();
++                break;
++            }
++
++            /* Request fulfilled */
++            if ((size_t) bytes >= length)
++                break;
++
++            length -= bytes;
++        }
+     }
+ }
+ 
+@@ -460,7 +473,7 @@
+                 }
+ 
+             } else {
+-                if (pa_stream_connect_record(stream, device, latency > 0 ? &buffer_attr : NULL, flags) < 0) {
++                if (pa_stream_connect_record(stream, device, &buffer_attr, flags) < 0) {
+                     pa_log(_("pa_stream_connect_record() failed: %s"), pa_strerror(pa_context_errno(c)));
+                     goto fail;
+                 }
+Index: pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478/src/utils/pacmd.c
+===================================================================
+--- pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478.orig/src/utils/pacmd.c	2010-01-17 18:54:20.000000000 -0500
++++ pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478/src/utils/pacmd.c	2010-09-18 08:44:02.000000000 -0400
+@@ -45,13 +45,6 @@
+ 
+ int main(int argc, char*argv[]) {
+ 
+-    enum {
+-        WATCH_STDIN,
+-        WATCH_STDOUT,
+-        WATCH_SOCKET,
+-        N_WATCH
+-    };
+-
+     pid_t pid ;
+     int fd = -1;
+     int ret = 1, i;
+@@ -60,7 +53,10 @@
+     size_t ibuf_index, ibuf_length, obuf_index, obuf_length;
+     char *cli;
+     pa_bool_t ibuf_eof, obuf_eof, ibuf_closed, obuf_closed;
+-    struct pollfd pollfd[N_WATCH];
++    struct pollfd pollfd[3];
++    struct pollfd *watch_socket, *watch_stdin, *watch_stdout;
++
++    int stdin_type = 0, stdout_type = 0, fd_type = 0;
+ 
+     setlocale(LC_ALL, "");
+     bindtextdomain(GETTEXT_PACKAGE, PULSE_LOCALEDIR);
+@@ -128,32 +124,53 @@
+         ibuf_eof = TRUE;
+     }
+ 
+-    pa_zero(pollfd);
+-
+-    pollfd[WATCH_STDIN].fd = STDIN_FILENO;
+-    pollfd[WATCH_STDOUT].fd = STDOUT_FILENO;
+-    pollfd[WATCH_SOCKET].fd = fd;
+-
+     for (;;) {
++        struct pollfd *p;
++
+         if (ibuf_eof &&
+             obuf_eof &&
+             ibuf_length <= 0 &&
+             obuf_length <= 0)
+             break;
+ 
+-        pollfd[WATCH_STDIN].events = pollfd[WATCH_STDOUT].events = pollfd[WATCH_SOCKET].events = 0;
++        if (ibuf_length <= 0 && ibuf_eof && !ibuf_closed) {
++            shutdown(fd, SHUT_WR);
++            ibuf_closed = TRUE;
++        }
++
++        if (obuf_length <= 0 && obuf_eof && !obuf_closed) {
++            shutdown(fd, SHUT_RD);
++            obuf_closed = TRUE;
++        }
++
++        pa_zero(pollfd);
+ 
+-        if (obuf_length > 0)
+-            pollfd[WATCH_STDOUT].events |= POLLOUT;
+-        else if (!obuf_eof)
+-            pollfd[WATCH_SOCKET].events |= POLLIN;
+-
+-        if (ibuf_length > 0)
+-            pollfd[WATCH_SOCKET].events |= POLLOUT;
+-        else if (!ibuf_eof)
+-            pollfd[WATCH_STDIN].events |= POLLIN;
++        p = pollfd;
+ 
+-        if (poll(pollfd, N_WATCH, -1) < 0) {
++        if (ibuf_length > 0 || (!obuf_eof && obuf_length <= 0)) {
++            watch_socket = p++;
++            watch_socket->fd = fd;
++            watch_socket->events =
++                (ibuf_length > 0 ? POLLOUT : 0) |
++                (!obuf_eof && obuf_length <= 0 ? POLLIN : 0);
++        } else
++            watch_socket = NULL;
++
++        if (!ibuf_eof && ibuf_length <= 0) {
++            watch_stdin = p++;
++            watch_stdin->fd = STDIN_FILENO;
++            watch_stdin->events = POLLIN;
++        } else
++            watch_stdin = NULL;
++
++        if (obuf_length > 0) {
++            watch_stdout = p++;
++            watch_stdout->fd = STDOUT_FILENO;
++            watch_stdout->events = POLLOUT;
++        } else
++            watch_stdout = NULL;
++
++        if (poll(pollfd, p-pollfd, -1) < 0) {
+ 
+             if (errno == EINTR)
+                 continue;
+@@ -162,82 +179,80 @@
+             goto fail;
+         }
+ 
+-        if (pollfd[WATCH_STDIN].revents & POLLIN) {
+-            ssize_t r;
+-            pa_assert(!ibuf_length);
+-
+-            if ((r = pa_read(STDIN_FILENO, ibuf, sizeof(ibuf), NULL)) <= 0) {
+-                if (r < 0) {
+-                    pa_log(_("read(): %s"), strerror(errno));
+-                    goto fail;
++        if (watch_stdin) {
++            if (watch_stdin->revents & POLLIN) {
++                ssize_t r;
++                pa_assert(ibuf_length <= 0);
++
++                if ((r = pa_read(STDIN_FILENO, ibuf, sizeof(ibuf), &stdin_type)) <= 0) {
++                    if (r < 0) {
++                        pa_log(_("read(): %s"), strerror(errno));
++                        goto fail;
++                    }
++
++                    ibuf_eof = TRUE;
++                } else {
++                    ibuf_length = (size_t) r;
++                    ibuf_index = 0;
+                 }
+-
++            } else if (watch_stdin->revents & POLLHUP)
+                 ibuf_eof = TRUE;
+-            } else {
+-                ibuf_length = (size_t) r;
+-                ibuf_index = 0;
+-            }
+         }
+ 
+-        if (pollfd[WATCH_SOCKET].revents & POLLIN) {
+-            ssize_t r;
+-            pa_assert(!obuf_length);
+-
+-            if ((r = pa_read(fd, obuf, sizeof(obuf), NULL)) <= 0) {
+-                if (r < 0) {
+-                    pa_log(_("read(): %s"), strerror(errno));
+-                    goto fail;
++        if (watch_socket) {
++            if (watch_socket->revents & POLLIN) {
++                ssize_t r;
++                pa_assert(obuf_length <= 0);
++
++                if ((r = pa_read(fd, obuf, sizeof(obuf), &fd_type)) <= 0) {
++                    if (r < 0) {
++                        pa_log(_("read(): %s"), strerror(errno));
++                        goto fail;
++                    }
++
++                    obuf_eof = TRUE;
++                } else {
++                    obuf_length = (size_t) r;
++                    obuf_index = 0;
+                 }
+-
++            } else if (watch_socket->revents & POLLHUP)
+                 obuf_eof = TRUE;
+-            } else {
+-                obuf_length = (size_t) r;
+-                obuf_index = 0;
+-            }
+         }
+ 
+-        if (pollfd[WATCH_STDOUT].revents & POLLHUP) {
+-            obuf_eof = TRUE;
+-            obuf_length = 0;
+-        } else if (pollfd[WATCH_STDOUT].revents & POLLOUT) {
+-            ssize_t r;
+-            pa_assert(obuf_length);
+-
+-            if ((r = pa_write(STDOUT_FILENO, obuf + obuf_index, obuf_length, NULL)) < 0) {
+-                pa_log(_("write(): %s"), strerror(errno));
+-                goto fail;
+-            }
++        if (watch_stdout) {
++            if (watch_stdout->revents & POLLHUP) {
++                obuf_eof = TRUE;
++                obuf_length = 0;
++            } else if (watch_stdout->revents & POLLOUT) {
++                ssize_t r;
++                pa_assert(obuf_length > 0);
+ 
+-            obuf_length -= (size_t) r;
+-            obuf_index += obuf_index;
+-        }
++                if ((r = pa_write(STDOUT_FILENO, obuf + obuf_index, obuf_length, &stdout_type)) < 0) {
++                    pa_log(_("write(): %s"), strerror(errno));
++                    goto fail;
++                }
+ 
+-        if (pollfd[WATCH_SOCKET].revents & POLLHUP) {
+-            ibuf_eof = TRUE;
+-            ibuf_length = 0;
+-        } if (pollfd[WATCH_SOCKET].revents & POLLOUT) {
+-            ssize_t r;
+-            pa_assert(ibuf_length);
+-
+-            if ((r = pa_write(fd, ibuf + ibuf_index, ibuf_length, NULL)) < 0) {
+-                pa_log(_("write(): %s"), strerror(errno));
+-                goto fail;
++                obuf_length -= (size_t) r;
++                obuf_index += obuf_index;
+             }
+-
+-            ibuf_length -= (size_t) r;
+-            ibuf_index += obuf_index;
+         }
+ 
+-        if (ibuf_length <= 0 && ibuf_eof && !ibuf_closed) {
+-            pa_close(STDIN_FILENO);
+-            shutdown(fd, SHUT_WR);
+-            ibuf_closed = TRUE;
+-        }
++        if (watch_socket) {
++            if (watch_socket->revents & POLLHUP) {
++                ibuf_eof = TRUE;
++                ibuf_length = 0;
++            } if (watch_socket->revents & POLLOUT) {
++                ssize_t r;
++                pa_assert(ibuf_length > 0);
+ 
+-        if (obuf_length <= 0 && obuf_eof && !obuf_closed) {
+-            shutdown(fd, SHUT_RD);
+-            pa_close(STDOUT_FILENO);
+-            obuf_closed = TRUE;
++                if ((r = pa_write(fd, ibuf + ibuf_index, ibuf_length, &fd_type)) < 0) {
++                    pa_log(_("write(): %s"), strerror(errno));
++                    goto fail;
++                }
++
++                ibuf_length -= (size_t) r;
++                ibuf_index += obuf_index;
++            }
+         }
+     }
+ 
+Index: pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478/src/utils/padsp.c
+===================================================================
+--- pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478.orig/src/utils/padsp.c	2009-09-17 16:36:36.000000000 -0400
++++ pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478/src/utils/padsp.c	2010-09-18 08:44:02.000000000 -0400
+@@ -1458,11 +1458,11 @@
+         return _open(filename, flags, mode);
+     }
+ 
+-    if (filename && dsp_cloak_enable() && (strcmp(filename, "/dev/dsp") == 0 || strcmp(filename, "/dev/adsp") == 0))
++    if (filename && dsp_cloak_enable() && (pa_streq(filename, "/dev/dsp") || pa_streq(filename, "/dev/adsp") || pa_streq(filename, "/dev/audio")))
+         r = dsp_open(flags, &_errno);
+-    else if (filename && mixer_cloak_enable() && strcmp(filename, "/dev/mixer") == 0)
++    else if (filename && mixer_cloak_enable() && pa_streq(filename, "/dev/mixer"))
+         r = mixer_open(flags, &_errno);
+-    else if (filename && sndstat_cloak_enable() && strcmp(filename, "/dev/sndstat") == 0)
++    else if (filename && sndstat_cloak_enable() && pa_streq(filename, "/dev/sndstat"))
+         r = sndstat_open(flags, &_errno);
+     else {
+         function_exit();
+@@ -2383,15 +2383,21 @@
+     return 0;
+ }
+ 
++static pa_bool_t is_audio_device_node(const char *path) {
++    return
++        pa_streq(path, "/dev/dsp") ||
++        pa_streq(path, "/dev/adsp") ||
++        pa_streq(path, "/dev/audio") ||
++        pa_streq(path, "/dev/sndstat") ||
++        pa_streq(path, "/dev/mixer");
++}
++
+ int access(const char *pathname, int mode) {
+ 
+     debug(DEBUG_LEVEL_VERBOSE, __FILE__": access(%s)\n", pathname?pathname:"NULL");
+ 
+     if (!pathname ||
+-        (strcmp(pathname, "/dev/dsp") != 0 &&
+-         strcmp(pathname, "/dev/adsp") != 0 &&
+-         strcmp(pathname, "/dev/sndstat") != 0 &&
+-         strcmp(pathname, "/dev/mixer") != 0 )) {
++        !is_audio_device_node(pathname)) {
+         LOAD_ACCESS_FUNC();
+         return _access(pathname, mode);
+     }
+@@ -2417,10 +2423,7 @@
+ 
+     if (!pathname ||
+         !buf ||
+-        ( strcmp(pathname, "/dev/dsp") != 0 &&
+-          strcmp(pathname, "/dev/adsp") != 0 &&
+-          strcmp(pathname, "/dev/sndstat") != 0 &&
+-          strcmp(pathname, "/dev/mixer") != 0 )) {
++        !is_audio_device_node(pathname)) {
+         debug(DEBUG_LEVEL_VERBOSE, __FILE__": stat(%s)\n", pathname?pathname:"NULL");
+         LOAD_STAT_FUNC();
+         return _stat(pathname, buf);
+@@ -2474,10 +2477,7 @@
+ 
+     if (!pathname ||
+         !buf ||
+-        ( strcmp(pathname, "/dev/dsp") != 0 &&
+-          strcmp(pathname, "/dev/adsp") != 0 &&
+-          strcmp(pathname, "/dev/sndstat") != 0 &&
+-          strcmp(pathname, "/dev/mixer") != 0 )) {
++        !is_audio_device_node(pathname)) {
+         LOAD_STAT64_FUNC();
+         return _stat64(pathname, buf);
+     }
+@@ -2519,10 +2519,7 @@
+     }
+ 
+     if (!filename ||
+-        ( strcmp(filename, "/dev/dsp") != 0 &&
+-          strcmp(filename, "/dev/adsp") != 0 &&
+-          strcmp(filename, "/dev/sndstat") != 0 &&
+-          strcmp(filename, "/dev/mixer") != 0 )) {
++        !is_audio_device_node(filename)) {
+         LOAD_OPEN64_FUNC();
+         return _open64(filename, flags, mode);
+     }
+@@ -2539,10 +2536,7 @@
+ 
+     if (!pathname ||
+         !buf ||
+-        ( strcmp(pathname, "/dev/dsp") != 0 &&
+-          strcmp(pathname, "/dev/adsp") != 0 &&
+-          strcmp(pathname, "/dev/sndstat") != 0 &&
+-          strcmp(pathname, "/dev/mixer") != 0 )) {
++        !is_audio_device_node(pathname)) {
+         LOAD_XSTAT_FUNC();
+         return ___xstat(ver, pathname, buf);
+     }
+@@ -2562,10 +2556,7 @@
+ 
+     if (!pathname ||
+         !buf ||
+-        ( strcmp(pathname, "/dev/dsp") != 0 &&
+-          strcmp(pathname, "/dev/adsp") != 0 &&
+-          strcmp(pathname, "/dev/sndstat") != 0 &&
+-          strcmp(pathname, "/dev/mixer") != 0 )) {
++        !is_audio_device_node(pathname)) {
+         LOAD_XSTAT64_FUNC();
+         return ___xstat64(ver, pathname, buf);
+     }
+@@ -2591,10 +2582,7 @@
+ 
+     if (!filename ||
+         !mode ||
+-        ( strcmp(filename, "/dev/dsp") != 0 &&
+-          strcmp(filename, "/dev/adsp") != 0 &&
+-          strcmp(filename, "/dev/sndstat") != 0 &&
+-          strcmp(filename, "/dev/mixer") != 0 )) {
++        !is_audio_device_node(filename)) {
+         LOAD_FOPEN_FUNC();
+         return _fopen(filename, mode);
+     }
+@@ -2634,10 +2622,7 @@
+ 
+     if (!filename ||
+         !mode ||
+-        ( strcmp(filename, "/dev/dsp") != 0 &&
+-          strcmp(filename, "/dev/adsp") != 0 &&
+-          strcmp(filename, "/dev/sndstat") != 0 &&
+-          strcmp(filename, "/dev/mixer") != 0 )) {
++        !is_audio_device_node(filename)) {
+         LOAD_FOPEN64_FUNC();
+         return _fopen64(filename, mode);
+     }
+Index: pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478/src/utils/pax11publish.c
+===================================================================
+--- pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478.orig/src/utils/pax11publish.c	2009-04-03 17:09:39.000000000 -0400
++++ pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478/src/utils/pax11publish.c	2010-09-18 08:56:44.000000000 -0400
+@@ -29,8 +29,7 @@
+ #include <assert.h>
+ #include <locale.h>
+ 
+-#include <X11/Xlib.h>
+-#include <X11/Xatom.h>
++#include <xcb/xcb.h>
+ 
+ #include <pulse/util.h>
+ #include <pulse/i18n.h>
+@@ -45,8 +44,8 @@
+ 
+ int main(int argc, char *argv[]) {
+     const char *dname = NULL, *sink = NULL, *source = NULL, *server = NULL, *cookie_file = PA_NATIVE_COOKIE_FILE;
+-    int c, ret = 1;
+-    Display *d = NULL;
++    int c, ret = 1, screen = 0;
++    xcb_connection_t *xcb = NULL;
+     enum { DUMP, EXPORT, IMPORT, REMOVE } mode = DUMP;
+ 
+     setlocale(LC_ALL, "");
+@@ -96,21 +95,26 @@
+         }
+     }
+ 
+-    if (!(d = XOpenDisplay(dname))) {
+-        pa_log(_("XOpenDisplay() failed"));
++    if (!(xcb = xcb_connect(dname, &screen))) {
++        pa_log(_("xcb_connect() failed"));
++        goto finish;
++    }
++
++    if (xcb_connection_has_error(xcb)) {
++        pa_log(_("xcb_connection_has_error() returned true"));
+         goto finish;
+     }
+ 
+     switch (mode) {
+         case DUMP: {
+             char t[1024];
+-            if (pa_x11_get_prop(d, "PULSE_SERVER", t, sizeof(t)))
++            if (pa_x11_get_prop(xcb, screen, "PULSE_SERVER", t, sizeof(t)))
+                 printf(_("Server: %s\n"), t);
+-            if (pa_x11_get_prop(d, "PULSE_SOURCE", t, sizeof(t)))
++            if (pa_x11_get_prop(xcb, screen, "PULSE_SOURCE", t, sizeof(t)))
+                 printf(_("Source: %s\n"), t);
+-            if (pa_x11_get_prop(d, "PULSE_SINK", t, sizeof(t)))
++            if (pa_x11_get_prop(xcb, screen, "PULSE_SINK", t, sizeof(t)))
+                 printf(_("Sink: %s\n"), t);
+-            if (pa_x11_get_prop(d, "PULSE_COOKIE", t, sizeof(t)))
++            if (pa_x11_get_prop(xcb, screen, "PULSE_COOKIE", t, sizeof(t)))
+                 printf(_("Cookie: %s\n"), t);
+ 
+             break;
+@@ -118,14 +122,14 @@
+ 
+         case IMPORT: {
+             char t[1024];
+-            if (pa_x11_get_prop(d, "PULSE_SERVER", t, sizeof(t)))
++            if (pa_x11_get_prop(xcb, screen, "PULSE_SERVER", t, sizeof(t)))
+                 printf("PULSE_SERVER='%s'\nexport PULSE_SERVER\n", t);
+-            if (pa_x11_get_prop(d, "PULSE_SOURCE", t, sizeof(t)))
++            if (pa_x11_get_prop(xcb, screen, "PULSE_SOURCE", t, sizeof(t)))
+                 printf("PULSE_SOURCE='%s'\nexport PULSE_SOURCE\n", t);
+-            if (pa_x11_get_prop(d, "PULSE_SINK", t, sizeof(t)))
++            if (pa_x11_get_prop(xcb, screen, "PULSE_SINK", t, sizeof(t)))
+                 printf("PULSE_SINK='%s'\nexport PULSE_SINK\n", t);
+ 
+-            if (pa_x11_get_prop(d, "PULSE_COOKIE", t, sizeof(t))) {
++            if (pa_x11_get_prop(xcb, screen, "PULSE_COOKIE", t, sizeof(t))) {
+                 uint8_t cookie[PA_NATIVE_COOKIE_LENGTH];
+                 size_t l;
+                 if ((l = pa_parsehex(t, cookie, sizeof(cookie))) != sizeof(cookie)) {
+@@ -158,16 +162,16 @@
+                 goto finish;
+             }
+ 
+-            pa_x11_del_prop(d, "PULSE_SERVER");
+-            pa_x11_del_prop(d, "PULSE_SINK");
+-            pa_x11_del_prop(d, "PULSE_SOURCE");
+-            pa_x11_del_prop(d, "PULSE_ID");
+-            pa_x11_del_prop(d, "PULSE_COOKIE");
++            pa_x11_del_prop(xcb, screen, "PULSE_SERVER");
++            pa_x11_del_prop(xcb, screen, "PULSE_SINK");
++            pa_x11_del_prop(xcb, screen, "PULSE_SOURCE");
++            pa_x11_del_prop(xcb, screen, "PULSE_ID");
++            pa_x11_del_prop(xcb, screen, "PULSE_COOKIE");
+ 
+             if (server)
+-                pa_x11_set_prop(d, "PULSE_SERVER", server);
++                pa_x11_set_prop(xcb, screen, "PULSE_SERVER", server);
+             else if (conf->default_server)
+-                pa_x11_set_prop(d, "PULSE_SERVER", conf->default_server);
++                pa_x11_set_prop(xcb, screen, "PULSE_SERVER", conf->default_server);
+             else {
+                 char hn[256];
+                 if (!pa_get_fqdn(hn, sizeof(hn))) {
+@@ -175,18 +179,18 @@
+                     goto finish;
+                 }
+ 
+-                pa_x11_set_prop(d, "PULSE_SERVER", hn);
++                pa_x11_set_prop(xcb, screen, "PULSE_SERVER", hn);
+             }
+ 
+             if (sink)
+-                pa_x11_set_prop(d, "PULSE_SINK", sink);
++                pa_x11_set_prop(xcb, screen, "PULSE_SINK", sink);
+             else if (conf->default_sink)
+-                pa_x11_set_prop(d, "PULSE_SINK", conf->default_sink);
++                pa_x11_set_prop(xcb, screen, "PULSE_SINK", conf->default_sink);
+ 
+             if (source)
+-                pa_x11_set_prop(d, "PULSE_SOURCE", source);
++                pa_x11_set_prop(xcb, screen, "PULSE_SOURCE", source);
+             if (conf->default_source)
+-                pa_x11_set_prop(d, "PULSE_SOURCE", conf->default_source);
++                pa_x11_set_prop(xcb, screen, "PULSE_SOURCE", conf->default_source);
+ 
+             pa_client_conf_free(conf);
+ 
+@@ -195,16 +199,16 @@
+                 goto finish;
+             }
+ 
+-            pa_x11_set_prop(d, "PULSE_COOKIE", pa_hexstr(cookie, sizeof(cookie), hx, sizeof(hx)));
++            pa_x11_set_prop(xcb, screen, "PULSE_COOKIE", pa_hexstr(cookie, sizeof(cookie), hx, sizeof(hx)));
+             break;
+         }
+ 
+         case REMOVE:
+-            pa_x11_del_prop(d, "PULSE_SERVER");
+-            pa_x11_del_prop(d, "PULSE_SINK");
+-            pa_x11_del_prop(d, "PULSE_SOURCE");
+-            pa_x11_del_prop(d, "PULSE_ID");
+-            pa_x11_del_prop(d, "PULSE_COOKIE");
++            pa_x11_del_prop(xcb, screen, "PULSE_SERVER");
++            pa_x11_del_prop(xcb, screen, "PULSE_SINK");
++            pa_x11_del_prop(xcb, screen, "PULSE_SOURCE");
++            pa_x11_del_prop(xcb, screen, "PULSE_ID");
++            pa_x11_del_prop(xcb, screen, "PULSE_COOKIE");
+             break;
+ 
+         default:
+@@ -216,9 +220,9 @@
+ 
+ finish:
+ 
+-    if (d) {
+-        XSync(d, False);
+-        XCloseDisplay(d);
++    if (xcb) {
++        xcb_flush(xcb);
++        xcb_disconnect(xcb);
+     }
+ 
+     return ret;
+Index: pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478/vala/libpulse.vapi
+===================================================================
+--- pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478.orig/vala/libpulse.vapi	2009-09-18 21:05:23.000000000 -0400
++++ pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478/vala/libpulse.vapi	2010-09-18 08:44:02.000000000 -0400
+@@ -46,7 +46,7 @@
+         [CCode (cname="PA_CHECK_VERSION")]
+         public bool CHECK_VERSION(int major, int minor, int micro);
+ 
+-        [CCode (cname="INVALID_INDEX")]
++        [CCode (cname="PA_INVALID_INDEX")]
+         public const uint32 INVALID_INDEX;
+ 
+         [CCode (cname="pa_free_cb_t")]
+@@ -879,11 +879,11 @@
+         }
+ 
+         [Compact]
+-        [CCode (cname="pa_glib_mainloop", cprefix="pa_glib_mainloop_", free_function="pa_glib_mainloop_free")]
++        [CCode (cheader_filename="pulse/glib-mainloop.h", cname="pa_glib_mainloop", cprefix="pa_glib_mainloop_", free_function="pa_glib_mainloop_free")]
+         public class GLibMainLoop {
+ 
+                 [CCode (cname="pa_glib_mainloop_new")]
+-                public GLibMainLoop();
++                public GLibMainLoop(MainContext? c = null);
+ 
+                 public unowned MainLoopApi get_api();
+         }
+@@ -1024,7 +1024,7 @@
+                 public Operation? suspend_sink_by_index(uint32 idx, bool suspend, SuccessCb? cb = null);
+ 
+                 public Operation? set_sink_port_by_name(string name, string port, SuccessCb? cb = null);
+-                public Operation? set_sink_port_by_index(string idx, string port, SuccessCb? cb = null);
++                public Operation? set_sink_port_by_index(uint32 idx, string port, SuccessCb? cb = null);
+ 
+                 public Operation? get_source_info_by_name(string name, SourceInfoCb cb);
+                 public Operation? get_source_info_by_index(uint32 idx, SourceInfoCb cb);
+@@ -1039,7 +1039,7 @@
+                 public Operation? suspend_source_by_index(uint32 idx, bool suspend, SuccessCb? cb = null);
+ 
+                 public Operation? set_source_port_by_name(string name, string port, SuccessCb? cb = null);
+-                public Operation? set_source_port_by_index(string idx, string port, SuccessCb? cb = null);
++                public Operation? set_source_port_by_index(uint32 idx, string port, SuccessCb? cb = null);
+ 
+                 public Operation? get_server_info(ServerInfoCb cb);
+ 

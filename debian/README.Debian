@@ -1,0 +1,35 @@
+pulseaudio for Debian (and Ubuntu)
+----------------------------------
+
+The pulseaudio executable is installed suid root. This is the recommended
+configuration as it allows pulseaudio to run with realtime priority. After
+grabbing the realtime capability, pulseaudio drops all other root
+privileges. Only users in the pulse-rt group are granted realtime
+privileges in this way. It is highly recommended that all users that will
+be running pulseaudio should be added to the pulse-rt group to prevent
+skipping and dropouts in audio output. You should also enable the
+high-priority option in /etc/pulse/daemon.conf to ensure that pulseaudio is
+started with realtime priority.
+
+PLEASE NOTE: PulseAudio's default configuration uses high quality sample
+rate conversion that may be overly CPU intensive. If PulseAudio's CPU usage
+is unacceptable on your hardware, please change the resample-method option
+in /etc/pulse/daemon.conf to either src-linear or trivial. See daemon.conf
+for more details.
+
+ -- CJ van den Berg <cj@vdbonline.com>, Mon, 28 Aug 2006 00:31:10 +0200
+
+
+In Ubuntu 9.10 and later releases, the default resampling option has been
+set to speex-float-1. Also note that per-user session daemon invocation is
+used (see comments in /etc/default/pulseaudio). If you wish to prevent per-
+user session daemons from being invoked, remember to edit
+/etc/pulse/client.conf (or create ~/.pulse/client.conf) and ensure that
+"autospawn = no" is present and uncommented.
+
+In Ubuntu 10.04, CJ's caveat above regarding suid root is no longer
+applicable thanks to a Linux 2.6.32 base and the use of RtKit.
+
+Please use "ubuntu-bug pulseaudio" to file defect reports.
+
+ -- Daniel T Chen <crimsun@ubuntu.com>, Mon, 23 Nov 2009 07:57:30 -0500
