@@ -1,0 +1,190 @@
+### v8, implemented by >= 0.8
+
+First version supported.
+
+### v9, implemented by >= 0.9.0
+
+Reply for PA_COMMAND_CREATE_PLAYBACK_STREAM,
+PA_COMMAND_CREATE_RECORD_STREAM now returns buffer_attrs that are used:
+
+Four new fields in reply of PA_COMMAND_CREATE_PLAYBACK_STREAM:
+
+   maxlength
+   tlength
+   prebuf
+   minreq
+
+Two new fields in reply of PA_COMMAND_CREATE_RECORD_STREAM:
+
+   maxlength
+   fragsize
+
+### v10, implemented by >= 0.9.5
+
+New opcodes:
+
+ PA_COMMAND_MOVE_SINK_INPUT
+ PA_COMMAND_MOVE_SOURCE_OUTPUT
+
+SHM data transfer support
+
+### v11, implemented by >= 0.9.7
+
+Reply to to PA_COMMAND_GET_SINK_INPUT_INFO, PA_COMMAND_GET_SINK_INPUT_INFO_LIST gets new field at the end:
+
+ mute
+
+New opcodes:
+
+ PA_COMMAND_SET_SINK_INPUT_MUTE
+ PA_COMMAND_SUSPEND_SINK
+ PA_COMMAND_SUSPEND_SOURCE
+
+### v12, implemented by >= 0.9.8
+
+S32LE, S32BE is now known as sample spec.
+
+Gained six new bool fields for PA_COMMAND_CREATE_PLAYBACK_STREAM, PA_COMMAND_CREATE_RECORD_STREAM request at the end:
+
+ no_remap_channels
+ no_remix_channels
+ fix_format
+ fix_rate
+ fix_channels
+ no_move
+ variable_rate
+
+Reply to these opcodes now includes:
+
+ sample_spec
+ channel_map
+ device_index
+ device_name
+ suspended
+
+New opcodes for changing buffer attrs:
+
+ PA_COMMAND_SET_PLAYBACK_STREAM_BUFFER_ATTR
+ PA_COMMAND_SET_RECORD_STREAM_BUFFER_ATTR
+
+New opcodes for changing sampling rate:
+
+ PA_COMMAND_UPDATE_PLAYBACK_STREAM_SAMPLE_RATE
+ PA_COMMAND_UPDATE_RECORD_STREAM_SAMPLE_RATE
+
+New opcodes for notifications:
+
+ PA_COMMAND_PLAYBACK_STREAM_SUSPENDED
+ PA_COMMAND_CAPTURE_STREAM_SUSPENDED
+ PA_COMMAND_PLAYBACK_STREAM_MOVED
+ PA_COMMAND_CAPTURE_STREAM_MOVED
+
+### v13, implemented by >= 0.9.11
+
+New fields for PA_COMMAND_CREATE_PLAYBACK_STREAM, PA_COMMAND_CREATE_RECORD_STREAM request at the end:
+
+ peak_detect (bool)
+ adjust_latency  (bool)
+
+Replace field "name" for PA_COMMAND_CREATE_PLAYBACK_STREAM, PA_COMMAND_CREATE_RECORD_STREAM at the end:
+
+ proplist
+
+Replace field "name" for PA_COMMAND_SET_CLIENT_NAME request at the end:
+
+ proplist
+
+On response of PA_COMMAND_SET_CLIENT_NAME:
+
+ client_index
+
+New proplist field for sink, source, sink input, source output introspection opcodes and at the end:
+
+ proplist
+
+New opcodes for proplist modifications
+
+  PA_COMMAND_UPDATE_RECORD_STREAM_PROPLIST
+  PA_COMMAND_UPDATE_PLAYBACK_STREAM_PROPLIST
+  PA_COMMAND_UPDATE_CLIENT_PROPLIST
+  PA_COMMAND_REMOVE_RECORD_STREAM_PROPLIST
+  PA_COMMAND_REMOVE_PLAYBACK_STREAM_PROPLIST
+  PA_COMMAND_REMOVE_CLIENT_PROPLIST
+
+New field for PA_COMMAND_PLAY_SAMPLE:
+
+  proplist
+
+New field for PA_COMMAND_PLAY_SAMPLE response:
+
+  idx
+
+New field for PA_COMMAND_CREATE_PLAYBACK_STREAM at the end:
+
+  start_muted
+
+Buffer attributes for PA_COMMAND_CREATE_PLAYBACK_STREAM and
+PA_COMMAND_CREATE_RECORD_STREAM may now be 0 for default values.
+
+New field for PA_COMMAND_SET_PLAYBACK_STREAM_BUFFER_ATTR,
+PA_COMMAND_SET_RECORD_STREAM_BUFFER_ATTR at the end:
+
+  adjust_latency (bool)
+
+new message:
+
+  PA_COMMAND_STARTED
+
+### v14, implemented by >= 0.9.12
+
+new message:
+
+  PA_COMMAND_EXTENSION
+
+PA_COMMAND_CREATE_PLAYBACK_STREAM:
+
+  bool volume_set at the end
+
+PA_COMMAND_CREATE_RECORD_STREAM, PA_COMMAND_CREATE_PLAYBACK_STREAM:
+
+  bool early_requests at the end
+
+New field for PA_COMMAND_SET_PLAYBACK_STREAM_BUFFER_ATTR,
+PA_COMMAND_SET_RECORD_STREAM_BUFFER_ATTR at the end:
+
+  early_requests (bool)
+
+### v15, implemented by >= 0.9.15
+
+PA_COMMAND_CREATE_PLAYBACK_STREAM
+
+  bool muted at the end
+
+PA_COMMAND_CREATE_PLAYBACK_STREAM, PA_COMMAND_CREATE_RECORD_STREAM:
+
+  bool dont_inhibit_auto_suspend at the end
+
+PA_COMMAND_GET_MODULE_INFO_LIST
+
+  remove bool auto_unload
+  add proplist at the end
+
+new messages:
+
+  PA_COMMAND_GET_CARD_INFO
+  PA_COMMAND_GET_CARD_INFO_LIST
+  PA_COMMAND_SET_CARD_PROFILE
+
+  PA_COMMAND_CLIENT_EVENT
+  PA_COMMAND_PLAYBACK_STREAM_EVENT
+  PA_COMMAND_RECORD_STREAM_EVENT
+
+  PA_COMMAND_PLAYBACK_BUFFER_ATTR_CHANGED
+  PA_COMMAND_RECORD_BUFFER_ATTR_CHANGED
+
+### v16, implemented by >= 0.9.15
+
+new messages:
+
+  PA_COMMAND_SET_SINK_PORT
+  PA_COMMAND_SET_SOURCE_PORT
