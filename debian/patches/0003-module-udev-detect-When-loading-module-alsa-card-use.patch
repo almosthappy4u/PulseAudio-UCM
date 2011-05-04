@@ -1,0 +1,24 @@
+From 7cedeae3c69e20369a99fc5855043689a41f9041 Mon Sep 17 00:00:00 2001
+From: Tanu Kaskinen <tanuk@iki.fi>
+Date: Tue, 24 Aug 2010 18:17:19 +0300
+Subject: [PATCH 03/10] module-udev-detect: When loading module-alsa-card, use namereg_fail=false.
+
+---
+ src/modules/module-udev-detect.c |    1 +
+ 1 files changed, 1 insertions(+), 0 deletions(-)
+
+diff --git a/src/modules/module-udev-detect.c b/src/modules/module-udev-detect.c
+index 3cf3e58..b039d39 100644
+--- a/src/modules/module-udev-detect.c
++++ b/src/modules/module-udev-detect.c
+@@ -383,6 +383,7 @@ static void card_changed(struct userdata *u, struct udev_device *dev) {
+     d->args = pa_sprintf_malloc("device_id=\"%s\" "
+                                 "name=\"%s\" "
+                                 "card_name=\"%s\" "
++                                "namereg_fail=false "
+                                 "tsched=%s "
+                                 "ignore_dB=%s "
+                                 "card_properties=\"module-udev-detect.discovered=1\"",
+-- 
+1.7.1
+

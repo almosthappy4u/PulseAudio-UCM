@@ -1,0 +1,54 @@
+From 200688504263956737159dbf6e4602e3178185b0 Mon Sep 17 00:00:00 2001
+From: Margarita Olaya Cabrera <magi@slimlogic.co.uk>
+Date: Mon, 14 Mar 2011 18:46:41 -0600
+Subject: [PATCH 05/10] alsa: add proplist ucm data
+
+UCM has various properties we would like to store in a proplist. Add
+these properties to the proplist property types.
+
+Signed-off-by: Margarita Olaya Cabrera <magi@slimlogic.co.uk>
+---
+ src/pulse/proplist.h |   27 +++++++++++++++++++++++++++
+ 1 files changed, 27 insertions(+), 0 deletions(-)
+
+diff --git a/src/pulse/proplist.h b/src/pulse/proplist.h
+index 6283177..bd49fe4 100644
+--- a/src/pulse/proplist.h
++++ b/src/pulse/proplist.h
+@@ -245,6 +245,33 @@ PA_C_DECL_BEGIN
+ /** For modules: a version string for the module. e.g. "0.9.15" */
+ #define PA_PROP_MODULE_VERSION                 "module.version"
+ 
++/** For devices: List of verbs, devices or modifiers availables */
++#define PA_PROP_UCM_NAME	"ucm.name"
++
++/** For devices: List of supported devices per verb*/
++#define PA_PROP_UCM_DESCRIPTION		"ucm.description"
++
++/** For devices: Playback device name e.g PlaybackPCM */
++#define PA_PROP_UCM_SINK		"ucm.sink"
++
++/** For devices: Capture device name e.g CapturePCM*/
++#define PA_PROP_UCM_SOURCE		"ucm.source"
++
++/** For devices: Playback control volume ID string. e.g PlaybackVolume */
++#define PA_PROP_UCM_PLAYBACK_VOLUME	"ucm.playback.volume"
++
++/** For devices: Playback switch e.g PlaybackSwitch */
++#define PA_PROP_UCM_PLAYBACK_SWITCH	"ucm.playback.switch"
++
++/** For devices: Capture controls volume ID string. e.g CaptureVolume */
++#define PA_PROP_UCM_CAPTURE_VOLUME	"ucm.capture.volume"
++
++/** For devices: Capture switch e.g CaptureSwitch */
++#define PA_PROP_UCM_CAPTURE_SWITCH	"ucm.capture.switch"
++
++/** For devices: Quality of Service */
++#define PA_PROP_UCM_QOS			"ucm.qos"
++
+ /** A property list object. Basically a dictionary with ASCII strings
+  * as keys and arbitrary data as values. \since 0.9.11 */
+ typedef struct pa_proplist pa_proplist;
+-- 
+1.7.1
+

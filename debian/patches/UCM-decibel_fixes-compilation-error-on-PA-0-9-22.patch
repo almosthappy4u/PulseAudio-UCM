@@ -1,0 +1,12 @@
+Index: pulseaudio-0.9.22+stable-queue-24-g67d18/src/modules/alsa/alsa-ucm.c
+===================================================================
+--- pulseaudio-0.9.22+stable-queue-24-g67d18.orig/src/modules/alsa/alsa-ucm.c	2011-04-07 21:29:33.000000000 -0500
++++ pulseaudio-0.9.22+stable-queue-24-g67d18/src/modules/alsa/alsa-ucm.c	2011-04-07 21:29:45.000000000 -0500
+@@ -457,7 +457,6 @@
+     ps = pa_xnew0(pa_alsa_profile_set, 1);
+     ps->mappings = pa_hashmap_new(pa_idxset_string_hash_func, pa_idxset_string_compare_func);
+     ps->profiles = pa_hashmap_new(pa_idxset_string_hash_func, pa_idxset_string_compare_func);
+-    ps->decibel_fixes = pa_hashmap_new(pa_idxset_string_hash_func, pa_idxset_string_compare_func);
+ 
+     /* create a profile for each verb */
+     PA_LLIST_FOREACH(verb, ucm->verbs) {

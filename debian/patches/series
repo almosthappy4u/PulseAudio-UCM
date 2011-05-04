@@ -20,3 +20,15 @@
 0193-augment-properties-Search-for-.desktop-files-in-subf.patch
 0194-device-manager-Ensure-that-sinks-sources-populate-th.patch
 0195-SSE-MMX-ARM-Fix-high-frequency-noise-with-unusual-nu.patch
+0001-alsa-sink-source-Use-the-namereg_fail-module-argumen.patch
+0002-module-alsa-card-New-argument-namereg_fail.patch
+0003-module-udev-detect-When-loading-module-alsa-card-use.patch
+0004-alsa-make-visible-profile-functions.patch
+0005-alsa-add-proplist-ucm-data.patch
+0006-alsa-add-ucm-data-structures-and-calls.patch
+0007-alsa-add-support-for-ucm-profiles.patch
+0008-alsa-add-jack-detection-support.patch
+0009-alsa-add-hook-calls-for-jack-insertion-and-removal.patch
+0010-alsa-load-jack-detection-module.patch
+UCM-decibel_fixes-compilation-error-on-PA-0-9-22.patch
+UCM-undefined-references-pa_xxx.patch

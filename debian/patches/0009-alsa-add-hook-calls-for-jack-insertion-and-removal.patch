@@ -1,0 +1,152 @@
+From 8fe352358386f46d04691aa332365d75016c3087 Mon Sep 17 00:00:00 2001
+From: Margarita Olaya Cabrera <magi@slimlogic.co.uk>
+Date: Thu, 7 Apr 2011 19:04:13 -0500
+Subject: [PATCH 09/10] alsa: add hook calls for jack insertion and removal
+
+This patch adds hook for jack insertion and removal in order for
+the UCM device to be changed upon a jack event. Headset.0 device
+is used as default device in case of jack insertion.
+
+Signed-off-by: Margarita Olaya Cabrera <magi@slimlogic.co.uk>
+---
+ src/modules/alsa/alsa-ucm.h         |    2 +
+ src/modules/alsa/module-alsa-card.c |   87 +++++++++++++++++++++++++++++++++-
+ 2 files changed, 86 insertions(+), 3 deletions(-)
+
+diff --git a/src/modules/alsa/alsa-ucm.h b/src/modules/alsa/alsa-ucm.h
+index 97fcfca..a923d9a 100644
+--- a/src/modules/alsa/alsa-ucm.h
++++ b/src/modules/alsa/alsa-ucm.h
+@@ -73,6 +73,8 @@ struct pa_alsa_ucm_config {
+     snd_use_case_mgr_t *ucm_mgr;
+     const char *verb_ini;
+     const char *verb_new;
++    const char *dev_ini;
++    const char *dev_new;
+     pa_alsa_ucm_status_t status;
+ 
+     PA_LLIST_HEAD(pa_alsa_ucm_verb, verbs);
+diff --git a/src/modules/alsa/module-alsa-card.c b/src/modules/alsa/module-alsa-card.c
+index 7654c47..9656d1c 100644
+--- a/src/modules/alsa/module-alsa-card.c
++++ b/src/modules/alsa/module-alsa-card.c
+@@ -107,6 +107,10 @@ struct userdata {
+     pa_alsa_profile_set *profile_set;
+ 
+     pa_alsa_ucm_config ucm;
++
++    pa_hook_slot
++        *jack_insert_new_hook_slot,
++        *jack_remove_new_hook_slot;
+ };
+ 
+ static void add_profiles(struct userdata *u, pa_hashmap *h) {
+@@ -367,6 +371,73 @@ static int card_query_ucm_profiles(struct userdata *u, int card_index)
+     return 1;
+ }
+ 
++static pa_hook_result_t jack_insert_new_hook_callback(pa_core *c, void *new_data, struct userdata *u) {
++    struct pa_alsa_ucm_config *ucm = &u->ucm;
++    struct profile_data *d;
++    const char **enadev_list;
++    int num_dev, i;
++
++    pa_assert(u);
++
++    d = PA_CARD_PROFILE_DATA(u->card->active_profile);
++
++    pa_log_debug("Jack insert new hook callback");
++
++    num_dev = snd_use_case_get_list(ucm->ucm_mgr, "_enadevs", &enadev_list);
++    if (num_dev < 0) {
++        pa_log_info("no device found for %s", d->profile->name);
++        return PA_HOOK_CANCEL;
++    }
++
++    for (i = 0; i < num_dev; i += 2) {
++        if (strcmp(enadev_list[i], "Headset") == 0) {
++            pa_log_info("Headset device already set");
++            return PA_HOOK_OK;
++        }
++    }
++
++    /* Store current device */
++    ucm->dev_ini = enadev_list[0];
++
++    /* Set headset.0 device per default */
++    if (snd_use_case_set(ucm->ucm_mgr, "_enadev", "Headset.0") < 0) {
++        pa_log("failed to set device Headset.0");
++        return PA_HOOK_CANCEL;
++    }
++
++    ucm->dev_new = "Headset.0";
++    pa_log_info("set device Headset.0");
++    return PA_HOOK_OK;
++}
++
++static pa_hook_result_t jack_remove_new_hook_callback(pa_core *c, void *new_data, struct userdata *u) {
++    struct profile_data *d;
++    struct pa_alsa_ucm_config *ucm = &u->ucm;
++    char *tmp;
++
++    pa_assert(u);
++
++    d = PA_CARD_PROFILE_DATA(u->card->active_profile);
++
++    pa_log_debug("Jack removed new hook callback");
++
++    if (strcmp(ucm->dev_ini, ucm->dev_new) == 0) {
++        pa_log_debug("Device already set");
++        return PA_HOOK_OK;
++    }
++
++    /* Set previous device */
++    tmp = pa_sprintf_malloc("_swdev/%s", ucm->dev_new);
++    if ((snd_use_case_set(ucm->ucm_mgr, tmp, ucm->dev_ini)) < 0) {
++        pa_log("failed to switch device %s %s", tmp, ucm->dev_ini);
++        if (snd_use_case_set(ucm->ucm_mgr, "_disdev", ucm->dev_new) < 0)
++            pa_log("failed to disabled device %s", ucm->dev_new);
++    }
++
++    pa_xfree(tmp);
++    return PA_HOOK_OK;
++}
++
+ int pa__init(pa_module *m) {
+     pa_card_new_data data;
+     pa_modargs *ma;
+@@ -409,9 +480,12 @@ int pa__init(pa_module *m) {
+         }
+     }
+ 
+-    if (card_query_ucm_profiles(u, alsa_card_index))
++    if (card_query_ucm_profiles(u, alsa_card_index)) {
++        /* Initialize hooks for jack detection */
++        u->jack_insert_new_hook_slot = pa_hook_connect(&m->core->hooks[PA_CORE_HOOK_JACK_INSERT], PA_HOOK_NORMAL, (pa_hook_cb_t) jack_insert_new_hook_callback, u);
++        u->jack_remove_new_hook_slot = pa_hook_connect(&m->core->hooks[PA_CORE_HOOK_JACK_REMOVE], PA_HOOK_NORMAL, (pa_hook_cb_t) jack_remove_new_hook_callback, u);
+         pa_log_info("Found UCM profiles");
+-    else {
++    } else {
+ #ifdef HAVE_UDEV
+         fn = pa_udev_get_property(alsa_card_index, "PULSE_PROFILE_SET");
+ #endif
+@@ -540,8 +614,15 @@ void pa__done(pa_module*m) {
+             pa_alsa_source_free(s);
+     }
+ 
+-    if (u->ucm.status == PA_ALSA_UCM_ENABLED)
++    if (u->ucm.status == PA_ALSA_UCM_ENABLED) {
++        if (u->jack_insert_new_hook_slot)
++            pa_hook_slot_free(u->jack_insert_new_hook_slot);
++
++        if (u->jack_remove_new_hook_slot)
++            pa_hook_slot_free(u->jack_remove_new_hook_slot);
++
+         free_ucm(&u->ucm);
++    }
+ 
+     if (u->card)
+         pa_card_free(u->card);
+-- 
+1.7.1
+

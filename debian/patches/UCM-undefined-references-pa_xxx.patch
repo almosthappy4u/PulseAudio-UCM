@@ -1,0 +1,13 @@
+Index: pulseaudio-0.9.22+stable-queue-24-g67d18/src/Makefile.am
+===================================================================
+--- pulseaudio-0.9.22+stable-queue-24-g67d18.orig/src/Makefile.am	2011-03-08 23:08:38.000000000 -0600
++++ pulseaudio-0.9.22+stable-queue-24-g67d18/src/Makefile.am	2011-03-08 23:20:39.000000000 -0600
+@@ -1485,7 +1485,7 @@
+ 
+ module_alsa_jack_detect_la_SOURCES = modules/alsa/module-alsa-jack-detect.c
+ module_alsa_jack_detect_la_LDFLAGS = $(MODULE_LDFLAGS)
+-module_alsa_jack_detect_la_LIBADD = $(MODULE_LIBADD) $(ASOUNDLIB_LIBS) libalsa-util.la
++module_alsa_jack_detect_la_LIBADD = $(MODULE_LIBADD) $(ASOUNDLIB_LIBS) libalsa-util.la libpulsecore-@PA_MAJORMINORMICRO@.la libpulsecommon-@PA_MAJORMINORMICRO@.la libpulse.la
+ module_alsa_jack_detect_la_CFLAGS = $(AM_CFLAGS) $(ASOUNDLIB_CFLAGS)
+ 
+ # Solaris

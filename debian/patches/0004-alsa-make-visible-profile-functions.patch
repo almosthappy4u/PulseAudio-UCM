@@ -1,0 +1,93 @@
+From cc50975de8946abbc4049cff833d35a0810a72cd Mon Sep 17 00:00:00 2001
+From: Margarita Olaya Cabrera <magi@slimlogic.co.uk>
+Date: Mon, 14 Mar 2011 18:45:13 -0600
+Subject: [PATCH 04/10] alsa: make visible profile functions
+
+Export the alsa-mixer mapping API so that it can be used by the UCM core
+to create UCM mappings.
+
+Signed-off-by: Margarita Olaya Cabrera <magi@slimlogic.co.uk>
+---
+ src/modules/alsa/alsa-mixer.c |   10 +++++-----
+ src/modules/alsa/alsa-mixer.h |    9 +++++++++
+ 2 files changed, 14 insertions(+), 5 deletions(-)
+
+diff --git a/src/modules/alsa/alsa-mixer.c b/src/modules/alsa/alsa-mixer.c
+index 9de59ef..22f3c04 100644
+--- a/src/modules/alsa/alsa-mixer.c
++++ b/src/modules/alsa/alsa-mixer.c
+@@ -2478,7 +2478,7 @@ void pa_alsa_profile_set_free(pa_alsa_profile_set *ps) {
+     pa_xfree(ps);
+ }
+ 
+-static pa_alsa_mapping *mapping_get(pa_alsa_profile_set *ps, const char *name) {
++pa_alsa_mapping *mapping_get(pa_alsa_profile_set *ps, const char *name) {
+     pa_alsa_mapping *m;
+ 
+     if (!pa_startswith(name, "Mapping "))
+@@ -2789,7 +2789,7 @@ static int profile_parse_skip_probe(
+     return 0;
+ }
+ 
+-static int mapping_verify(pa_alsa_mapping *m, const pa_channel_map *bonus) {
++int mapping_verify(pa_alsa_mapping *m, const pa_channel_map *bonus) {
+ 
+     static const struct description_map well_known_descriptions[] = {
+         { "analog-mono",            N_("Analog Mono") },
+@@ -2862,7 +2862,7 @@ void pa_alsa_mapping_dump(pa_alsa_mapping *m) {
+                  m->direction);
+ }
+ 
+-static void profile_set_add_auto_pair(
++void profile_set_add_auto_pair(
+         pa_alsa_profile_set *ps,
+         pa_alsa_mapping *m, /* output */
+         pa_alsa_mapping *n  /* input */) {
+@@ -2910,7 +2910,7 @@ static void profile_set_add_auto_pair(
+     pa_hashmap_put(ps->profiles, p->name, p);
+ }
+ 
+-static void profile_set_add_auto(pa_alsa_profile_set *ps) {
++void profile_set_add_auto(pa_alsa_profile_set *ps) {
+     pa_alsa_mapping *m, *n;
+     void *m_state, *n_state;
+ 
+@@ -2927,7 +2927,7 @@ static void profile_set_add_auto(pa_alsa_profile_set *ps) {
+         profile_set_add_auto_pair(ps, NULL, n);
+ }
+ 
+-static int profile_verify(pa_alsa_profile *p) {
++int profile_verify(pa_alsa_profile *p) {
+ 
+     static const struct description_map well_known_descriptions[] = {
+         { "output:analog-mono+input:analog-mono",     N_("Analog Mono Duplex") },
+diff --git a/src/modules/alsa/alsa-mixer.h b/src/modules/alsa/alsa-mixer.h
+index a0d4fcb..fb092e4 100644
+--- a/src/modules/alsa/alsa-mixer.h
++++ b/src/modules/alsa/alsa-mixer.h
+@@ -207,6 +207,11 @@ int pa_alsa_path_set_mute(pa_alsa_path *path, snd_mixer_t *m, pa_bool_t muted);
+ int pa_alsa_path_select(pa_alsa_path *p, snd_mixer_t *m);
+ void pa_alsa_path_set_callback(pa_alsa_path *p, snd_mixer_t *m, snd_mixer_elem_callback_t cb, void *userdata);
+ void pa_alsa_path_free(pa_alsa_path *p);
++pa_alsa_mapping *mapping_get(pa_alsa_profile_set *ps, const char *name);
++int mapping_verify(pa_alsa_mapping *m, const pa_channel_map *bonus);
++void profile_set_add_auto(pa_alsa_profile_set *ps);
++void profile_set_add_auto_pair(pa_alsa_profile_set *ps, pa_alsa_mapping *m, pa_alsa_mapping *n);
++int profile_verify(pa_alsa_profile *p);
+ 
+ pa_alsa_path_set *pa_alsa_path_set_new(pa_alsa_mapping *m, pa_alsa_direction_t direction);
+ void pa_alsa_path_set_probe(pa_alsa_path_set *s, snd_mixer_t *m, pa_bool_t ignore_dB);
+@@ -214,6 +219,10 @@ void pa_alsa_path_set_dump(pa_alsa_path_set *s);
+ void pa_alsa_path_set_set_callback(pa_alsa_path_set *ps, snd_mixer_t *m, snd_mixer_elem_callback_t cb, void *userdata);
+ void pa_alsa_path_set_free(pa_alsa_path_set *s);
+ 
++struct profile_data {
++    pa_alsa_profile *profile;
++};
++
+ struct pa_alsa_mapping {
+     pa_alsa_profile_set *profile_set;
+ 
+-- 
+1.7.1
+

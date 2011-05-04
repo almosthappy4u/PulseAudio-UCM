@@ -1,0 +1,334 @@
+From c6c93770bc2f5f73e891b9166bae043e3a6ba6dd Mon Sep 17 00:00:00 2001
+From: Margarita Olaya Cabrera <magi@slimlogic.co.uk>
+Date: Mon, 14 Mar 2011 18:28:47 -0600
+Subject: [PATCH 08/10] alsa: add jack detection support
+
+This patch adds support for reading the status of sound card jack input
+devices (i.e. jack insertion/removal detection).
+
+A new module is created in order to monitor the status of sound card
+jack insertion and removal events. It does this by creating a thread
+that blocks on reading the sound card input event device and then firing
+a hook that reports the jack status change.
+
+Signed-off-by: Margarita Olaya Cabrera <magi@slimlogic.co.uk>
+---
+ src/Makefile.am                            |    9 +-
+ src/modules/alsa/module-alsa-jack-detect.c |  207 ++++++++++++++++++++++++++++
+ src/pulsecore/core.h                       |    2 +
+ src/pulsecore/jack-detect.h                |   42 ++++++
+ 4 files changed, 259 insertions(+), 1 deletions(-)
+ create mode 100644 src/modules/alsa/module-alsa-jack-detect.c
+ create mode 100644 src/pulsecore/jack-detect.h
+
+diff --git a/src/Makefile.am b/src/Makefile.am
+index 5ec921a..a4584c0 100644
+--- a/src/Makefile.am
++++ b/src/Makefile.am
+@@ -1086,7 +1086,8 @@ modlibexec_LTLIBRARIES += \
+ 		libalsa-util.la \
+ 		module-alsa-sink.la \
+ 		module-alsa-source.la \
+-		module-alsa-card.la
++		module-alsa-card.la \
++		module-alsa-jack-detect.la
+ 
+ alsaprofilesets_DATA = ${ALSA_PROFILES}
+ 
+@@ -1223,6 +1224,7 @@ SYMDEF_FILES = \
+ 		modules/alsa/module-alsa-sink-symdef.h \
+ 		modules/alsa/module-alsa-source-symdef.h \
+ 		modules/alsa/module-alsa-card-symdef.h \
++		modules/alsa/module-alsa-jack-detect-symdef.h\
+ 		modules/module-solaris-symdef.h \
+ 		modules/module-waveout-symdef.h \
+ 		modules/module-detect-symdef.h \
+@@ -1470,6 +1472,11 @@ module_alsa_card_la_LDFLAGS = $(MODULE_LDFLAGS)
+ module_alsa_card_la_LIBADD = $(AM_LIBADD) $(ASOUNDLIB_LIBS) libalsa-util.la libpulsecore-@PA_MAJORMINORMICRO@.la libpulsecommon-@PA_MAJORMINORMICRO@.la libpulse.la
+ module_alsa_card_la_CFLAGS = $(AM_CFLAGS) $(ASOUNDLIB_CFLAGS)
+ 
++module_alsa_jack_detect_la_SOURCES = modules/alsa/module-alsa-jack-detect.c
++module_alsa_jack_detect_la_LDFLAGS = $(MODULE_LDFLAGS)
++module_alsa_jack_detect_la_LIBADD = $(MODULE_LIBADD) $(ASOUNDLIB_LIBS) libalsa-util.la
++module_alsa_jack_detect_la_CFLAGS = $(AM_CFLAGS) $(ASOUNDLIB_CFLAGS)
++
+ # Solaris
+ 
+ module_solaris_la_SOURCES = modules/module-solaris.c
+diff --git a/src/modules/alsa/module-alsa-jack-detect.c b/src/modules/alsa/module-alsa-jack-detect.c
+new file mode 100644
+index 0000000..fa01ba4
+--- /dev/null
++++ b/src/modules/alsa/module-alsa-jack-detect.c
+@@ -0,0 +1,207 @@
++/***
++ This file is part of PulseAudio.
++
++ Copyright 2011 Wolfson Microelectronics PLC
++ Author Margarita Olaya <magi@slimlogic.co.uk>
++
++ PulseAudio is free software; you can redistribute it and/or modify
++ it under the terms of the GNU Lesser General Public License as published
++ by the Free Software Foundation; either version 2.1 of the License,
++ or (at your option) any later version.
++
++ PulseAudio is distributed in the hope that it will be useful, but
++ WITHOUT ANY WARRANTY; without even the implied warranty of
++ MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
++ General Public License for more details.
++
++ You should have received a copy of the GNU Lesser General Public License
++ along with PulseAudio; if not, write to the Free Software
++ Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA 02111-1307
++ USA.
++
++ Jack detect integration was kindly sponsored by Wolfson Microelectronics PLC.
++***/
++
++#ifdef HAVE_CONFIG_H
++#include <config.h>
++#endif
++
++#include <pulse/xmalloc.h>
++#include <pulsecore/core-util.h>
++#include <pulsecore/modargs.h>
++#include <pulsecore/jack-detect.h>
++#include <pulsecore/thread.h>
++#include <pulse/proplist.h>
++
++#include "alsa-util.h"
++#include <sys/types.h>
++#include <sys/stat.h>
++#include <fcntl.h>
++#include <unistd.h>
++#include <sys/ioctl.h>
++#include <linux/input.h>
++
++#include "module-alsa-jack-detect-symdef.h"
++
++PA_MODULE_AUTHOR("Margarita Olaya");
++PA_MODULE_DESCRIPTION("ALSA Jack Detect");
++PA_MODULE_VERSION(PACKAGE_VERSION);
++PA_MODULE_LOAD_ONCE(FALSE);
++PA_MODULE_USAGE(
++    "device_id=<ALSA jack device> "
++    "card_name=<name for the card> ");
++
++static const char* const valid_modargs[] = {
++    "card_name",
++    "device_id",
++    NULL
++};
++
++#define DEFAULT_DEVICE_ID "0"
++
++struct userdata {
++    pa_core *core;
++    pa_module *module;
++
++    char *device_id;
++    int fd;
++
++    char *card_name;
++    pa_thread *thread;
++};
++
++static void jack_report(struct userdata *u, struct input_event *event)
++{
++    pa_jack_detect_t jack;
++
++    jack.card = u->card_name;
++
++    pa_log_debug("card %s event type %x code %x value %x", u->card_name, event->code, event->type, event->value);
++
++    /* only process switch events */
++    if (event->type != EV_SW) {
++        pa_log_debug("card %s ignored event type %x", u->card_name, event->type);
++        return;
++    }
++
++    switch (event->code) {
++    case SW_HEADPHONE_INSERT:
++        jack.event = PA_JACK_HEADPHONES;
++        break;
++    case SW_MICROPHONE_INSERT:
++        jack.event = PA_JACK_MICROPHONE;
++        break;
++    case SW_LINEOUT_INSERT:
++        jack.event = PA_JACK_LINEOUT;
++        break;
++    case SW_JACK_PHYSICAL_INSERT:
++        jack.event = PA_JACK_UNKNOWN;
++        break;
++    default:
++        pa_log_debug("card %s ignored event code %x", u->card_name, event->code);
++        break;
++    }
++
++    if (event->value)
++        pa_hook_fire(&u->core->hooks[PA_CORE_HOOK_JACK_INSERT], &jack);
++    else
++        pa_hook_fire(&u->core->hooks[PA_CORE_HOOK_JACK_REMOVE], &jack);
++}
++
++static void *jack_detect_thread(void *tdata)
++{
++    struct userdata *u = tdata;
++    struct input_event event;
++
++    pa_assert(u);
++
++    pa_log_debug("jack thread started for card %s", u->card_name);
++
++    while (pa_read(u->fd, &event, sizeof(event), NULL) == sizeof(event)) {
++       jack_report(u, &event);
++    }
++
++    pa_log_debug("jack thread stopped for card %s", u->card_name);
++    return;
++}
++
++static void jack_get_initial_state(struct userdata *u)
++{
++    struct input_event event;
++    int err;
++
++    err = ioctl(u->fd, EVIOCGSW(sizeof(event)), &event);
++    if (err < 0) {
++        pa_log("Failed to read initial %s jack status %d", u->device_id, err);
++        return;
++    }
++
++    jack_report(u, &event);
++}
++
++int pa__init(pa_module *m) {
++    pa_modargs *ma;
++    struct userdata *u;
++    pa_alsa_refcnt_inc();
++    pa_assert(m);
++
++    if (!(ma = pa_modargs_new(m->argument, valid_modargs))) {
++        pa_log("Failed to parse module arguments");
++        goto fail;
++    }
++
++    m->userdata = u = pa_xnew0(struct userdata, 1);
++    u->core = m->core;
++    u->module = m;
++    u->device_id = pa_xstrdup(pa_modargs_get_value(ma, "device_id", DEFAULT_DEVICE_ID));
++    u->card_name = pa_xstrdup(pa_modargs_get_value(ma, "card_name", DEFAULT_DEVICE_ID));
++    u->core = m->core;
++
++    /* open the input event device */
++    if ((u->fd = open(u->device_id, O_RDONLY)) < 0)
++        goto fail_jack;
++
++    /* read the initial jack state */
++    jack_get_initial_state(u);
++
++    /* start the jack reader thread */
++    if (!(u->thread = pa_thread_new("jack-reader", jack_detect_thread, u))) {
++        pa_log("Failed to create jack reader thread");
++        goto fail_jack;
++    }
++
++    return 0;
++
++fail_jack:
++    pa_xfree(u->device_id);
++    pa_xfree(u->card_name);
++    pa_xfree(u);
++
++fail:
++    if (ma)
++        pa_modargs_free(ma);
++
++    pa__done(m);
++    return -1;
++}
++
++void pa__done(pa_module *m) {
++    struct userdata *u;
++
++    pa_assert(m);
++
++    if (!(u = m->userdata))
++        goto finish;
++
++    if (u->thread)
++        pa_thread_free(u->thread);
++
++    pa_close(u->fd);
++
++    pa_xfree(u->device_id);
++    pa_xfree(u->card_name);
++    pa_xfree(u);
++
++finish:
++    pa_alsa_refcnt_dec();
++}
+diff --git a/src/pulsecore/core.h b/src/pulsecore/core.h
+index c1002f9..4c9a4d1 100644
+--- a/src/pulsecore/core.h
++++ b/src/pulsecore/core.h
+@@ -103,6 +103,8 @@ typedef enum pa_core_hook {
+     PA_CORE_HOOK_CARD_NEW,
+     PA_CORE_HOOK_CARD_PUT,
+     PA_CORE_HOOK_CARD_UNLINK,
++    PA_CORE_HOOK_JACK_INSERT,
++    PA_CORE_HOOK_JACK_REMOVE,
+     PA_CORE_HOOK_MAX
+ } pa_core_hook_t;
+ 
+diff --git a/src/pulsecore/jack-detect.h b/src/pulsecore/jack-detect.h
+new file mode 100644
+index 0000000..4fc67c6
+--- /dev/null
++++ b/src/pulsecore/jack-detect.h
+@@ -0,0 +1,42 @@
++#ifndef foopulsejackdetecthfoo
++#define foopulsejackdetecthfoo
++
++/***
++  This file is part of PulseAudio.
++
++  Copyright 2011 Wolfson Microelectronics PLC
++  Author Margarita Olaya <magi@slimlogic.co.uk>
++
++  PulseAudio is free software; you can redistribute it and/or modify
++  it under the terms of the GNU Lesser General Public License as published
++  by the Free Software Foundation; either version 2.1 of the License,
++  or (at your option) any later version.
++
++  PulseAudio is distributed in the hope that it will be useful, but
++  WITHOUT ANY WARRANTY; without even the implied warranty of
++  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
++  General Public License for more details.
++
++  You should have received a copy of the GNU Lesser General Public License
++  along with PulseAudio; if not, write to the Free Software
++  Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA 02111-1307
++  USA.
++***/
++
++#include <inttypes.h>
++
++typedef enum pa_jack_event {
++    PA_JACK_HEADPHONES,
++    PA_JACK_HEADSET,
++    PA_JACK_MICROPHONE,
++    PA_JACK_LINEOUT,
++    PA_JACK_UNKNOWN,
++    PA_JACK_MAX
++} pa_jack_event_t;
++
++typedef struct pa_jack_detect {
++    pa_jack_event_t event;
++    char *card;
++} pa_jack_detect_t;
++
++#endif
+-- 
+1.7.1
+

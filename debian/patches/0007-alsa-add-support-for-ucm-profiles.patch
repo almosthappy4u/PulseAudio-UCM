@@ -1,0 +1,272 @@
+From e7ee2171c3f6cd978f26f5241e893c46e205707e Mon Sep 17 00:00:00 2001
+From: Margarita Olaya Cabrera <magi@slimlogic.co.uk>
+Date: Thu, 7 Apr 2011 18:55:26 -0500
+Subject: [PATCH 07/10] alsa: add support for ucm profiles
+
+This patch adds ALSA UCM (Use Case Manager) support to module alsa card.
+It checks if UCM is available for each card and if found it used the profiles
+generated with ucm data.
+
+Using a udev-rule user can decide if UCM will be used or not,
+Depending on the status of USE_UCM property, a flag is passed as
+module argument to module-alsa-card.
+
+Signed-off-by: Margarita Olaya Cabrera <magi@slimlogic.co.uk>
+---
+ src/modules/alsa/module-alsa-card.c |  117 ++++++++++++++++++++++++++++++++---
+ src/modules/module-udev-detect.c    |   11 +++-
+ 2 files changed, 118 insertions(+), 10 deletions(-)
+
+diff --git a/src/modules/alsa/module-alsa-card.c b/src/modules/alsa/module-alsa-card.c
+index 37b5a17..7654c47 100644
+--- a/src/modules/alsa/module-alsa-card.c
++++ b/src/modules/alsa/module-alsa-card.c
+@@ -39,6 +39,7 @@
+ #include "alsa-util.h"
+ #include "alsa-sink.h"
+ #include "alsa-source.h"
++#include "alsa-ucm.h"
+ #include "module-alsa-card-symdef.h"
+ 
+ PA_MODULE_AUTHOR("Lennart Poettering");
+@@ -64,7 +65,8 @@ PA_MODULE_USAGE(
+         "tsched_buffer_size=<buffer size when using timer based scheduling> "
+         "tsched_buffer_watermark=<lower fill watermark> "
+         "profile=<profile name> "
+-        "ignore_dB=<ignore dB information from the device?>");
++        "ignore_dB=<ignore dB information from the device?> "
++        "use_ucm=<Load Use Case Manager> ");
+ 
+ static const char* const valid_modargs[] = {
+     "name",
+@@ -86,6 +88,7 @@ static const char* const valid_modargs[] = {
+     "tsched_buffer_watermark",
+     "profile",
+     "ignore_dB",
++    "use_ucm",
+     NULL
+ };
+ 
+@@ -102,10 +105,8 @@ struct userdata {
+     pa_modargs *modargs;
+ 
+     pa_alsa_profile_set *profile_set;
+-};
+ 
+-struct profile_data {
+-    pa_alsa_profile *profile;
++    pa_alsa_ucm_config ucm;
+ };
+ 
+ static void add_profiles(struct userdata *u, pa_hashmap *h) {
+@@ -203,6 +204,15 @@ static int card_set_profile(pa_card *c, pa_card_profile *new_profile) {
+             am->source = NULL;
+         }
+ 
++    /* if UCM is avalible for this card then update the verb */
++    if (u->ucm.status == PA_ALSA_UCM_ENABLED) {
++        struct profile_data *d;
++	    /* current profile */
++        d = PA_CARD_PROFILE_DATA(u->card->active_profile);
++        if (ucm_set_profile(&u->ucm, nd->profile->name, d) < 0)
++            return -1;
++    }
++
+     if (nd->profile && nd->profile->output_mappings)
+         PA_IDXSET_FOREACH(am, nd->profile->output_mappings, idx) {
+ 
+@@ -236,15 +246,40 @@ static int card_set_profile(pa_card *c, pa_card_profile *new_profile) {
+     return 0;
+ }
+ 
+-static void init_profile(struct userdata *u) {
++static int init_profile(struct userdata *u) {
+     uint32_t idx;
+     pa_alsa_mapping *am;
+     struct profile_data *d;
++    char *device_name, *verb_name, *tmp;
++    struct pa_alsa_ucm_config *ucm = &u->ucm;
+ 
+     pa_assert(u);
+ 
+     d = PA_CARD_PROFILE_DATA(u->card->active_profile);
+ 
++    if (u->ucm.status == PA_ALSA_UCM_ENABLED) {
++        /* Set initial verb and device */
++        verb_name = pa_xstrdup(d->profile->name);
++        tmp = strchr(verb_name, ':');
++        if (!tmp) {
++            pa_log("no new verb found for %s", d->profile->name);
++            pa_xfree(verb_name);
++            return -1;
++        }
++        *tmp = 0;
++
++        if ((snd_use_case_set(ucm->ucm_mgr, "_verb", verb_name)) < 0) {
++            pa_log("failed to set verb %s", d->profile->name);
++            return -1;
++        }
++
++        device_name = strchr(d->profile->name, ':') + 2;
++        if (snd_use_case_set(ucm->ucm_mgr, "_enadev", device_name) < 0) {
++            pa_log("failed to set device %s", device_name);
++            return -1;
++        }
++    }
++
+     if (d->profile && d->profile->output_mappings)
+         PA_IDXSET_FOREACH(am, d->profile->output_mappings, idx)
+             am->sink = pa_alsa_sink_new(u->module, u->modargs, __FILE__, u->card, am);
+@@ -252,6 +287,8 @@ static void init_profile(struct userdata *u) {
+     if (d->profile && d->profile->input_mappings)
+         PA_IDXSET_FOREACH(am, d->profile->input_mappings, idx)
+             am->source = pa_alsa_source_new(u->module, u->modargs, __FILE__, u->card, am);
++
++    return 0;
+ }
+ 
+ static void set_card_name(pa_card_new_data *data, pa_modargs *ma, const char *device_id) {
+@@ -280,6 +317,56 @@ static void set_card_name(pa_card_new_data *data, pa_modargs *ma, const char *de
+     pa_xfree(t);
+ }
+ 
++static int card_query_ucm_profiles(struct userdata *u, int card_index)
++{
++    char *card_name;
++    const char **verb_list;
++    int num_verbs, i, err;
++
++    /* is UCM available for this card ? */
++    snd_card_get_name(card_index, &card_name);
++    err = snd_use_case_mgr_open(&u->ucm.ucm_mgr, card_name);
++    if (err < 0) {
++        pa_log("UCM not avaliable for card %s", card_name);
++        u->ucm.status = PA_ALSA_UCM_DISABLED;
++        return 0;
++    }
++
++    pa_log("UCM avaliable for card %s", card_name);
++
++    /* get a list of all UCM verbs (profiles) for this card */
++    num_verbs = snd_use_case_verb_list(u->ucm.ucm_mgr, &verb_list);
++    if (num_verbs <= 0) {
++        pa_log("UCM verb list not found for %s", card_name);
++        return 0;
++    }
++
++    /* get the properties of each UCM verb */
++    for (i = 0; i < num_verbs; i += 2) {
++        struct pa_alsa_ucm_verb *verb;
++
++        verb = pa_xnew0(pa_alsa_ucm_verb, 1);
++        verb->proplist = pa_proplist_new();
++
++        /* Get devices and modifiers for each verb */
++        err = ucm_get_properties(verb, u->ucm.ucm_mgr, verb_list[i]);
++        if (err < 0) {
++            pa_log("Failed to set the verb %s", verb_list[i]);
++            continue;
++	}
++
++        pa_proplist_sets(verb->proplist, PA_PROP_UCM_NAME, verb_list[i]);
++        PA_LLIST_PREPEND(pa_alsa_ucm_verb, u->ucm.verbs, verb);
++    }
++
++    /* create the profile set for the UCM card */
++    u->profile_set = add_ucm_profile_set(&u->ucm, &u->core->default_channel_map);
++    pa_alsa_profile_set_dump(u->profile_set);
++
++    u->ucm.status = PA_ALSA_UCM_ENABLED;
++    return 1;
++}
++
+ int pa__init(pa_module *m) {
+     pa_card_new_data data;
+     pa_modargs *ma;
+@@ -288,7 +375,7 @@ int pa__init(pa_module *m) {
+     pa_reserve_wrapper *reserve = NULL;
+     const char *description;
+     char *fn = NULL;
+-    pa_bool_t namereg_fail = FALSE;
++    pa_bool_t namereg_fail = FALSE, use_ucm = FALSE;
+ 
+     pa_alsa_refcnt_inc();
+ 
+@@ -322,12 +409,21 @@ int pa__init(pa_module *m) {
+         }
+     }
+ 
++    if (card_query_ucm_profiles(u, alsa_card_index))
++        pa_log_info("Found UCM profiles");
++    else {
+ #ifdef HAVE_UDEV
+-    fn = pa_udev_get_property(alsa_card_index, "PULSE_PROFILE_SET");
++        fn = pa_udev_get_property(alsa_card_index, "PULSE_PROFILE_SET");
+ #endif
+ 
+-    u->profile_set = pa_alsa_profile_set_new(fn, &u->core->default_channel_map);
+-    pa_xfree(fn);
++        if (pa_modargs_get_value(ma, "profile_set", NULL)) {
++            pa_xfree(fn);
++            fn = pa_xstrdup(pa_modargs_get_value(ma, "profile_set", NULL));
++        }
++
++        u->profile_set = pa_alsa_profile_set_new(fn, &u->core->default_channel_map);
++        pa_xfree(fn);
++    }
+ 
+     if (!u->profile_set)
+         goto fail;
+@@ -444,6 +540,9 @@ void pa__done(pa_module*m) {
+             pa_alsa_source_free(s);
+     }
+ 
++    if (u->ucm.status == PA_ALSA_UCM_ENABLED)
++        free_ucm(&u->ucm);
++
+     if (u->card)
+         pa_card_free(u->card);
+ 
+diff --git a/src/modules/module-udev-detect.c b/src/modules/module-udev-detect.c
+index b039d39..667210f 100644
+--- a/src/modules/module-udev-detect.c
++++ b/src/modules/module-udev-detect.c
+@@ -50,6 +50,7 @@ PA_MODULE_USAGE(
+ struct device {
+     char *path;
+     pa_bool_t need_verify;
++    pa_bool_t use_ucm;
+     char *card_name;
+     char *args;
+     uint32_t module;
+@@ -380,18 +381,26 @@ static void card_changed(struct userdata *u, struct udev_device *dev) {
+ 
+     n = pa_namereg_make_valid_name(t);
+     d->card_name = pa_sprintf_malloc("alsa_card.%s", n);
++
++    if (udev_device_get_property_value(dev, "USE_UCM"))
++        d->use_ucm = TRUE;
++    else
++        d->use_ucm = FALSE;
++
+     d->args = pa_sprintf_malloc("device_id=\"%s\" "
+                                 "name=\"%s\" "
+                                 "card_name=\"%s\" "
+                                 "namereg_fail=false "
+                                 "tsched=%s "
+                                 "ignore_dB=%s "
++                                "use_ucm=%d "
+                                 "card_properties=\"module-udev-detect.discovered=1\"",
+                                 path_get_card_id(path),
+                                 n,
+                                 d->card_name,
+                                 pa_yes_no(u->use_tsched),
+-                                pa_yes_no(u->ignore_dB));
++                                pa_yes_no(u->ignore_dB),
++                                d->use_ucm);
+     pa_xfree(n);
+ 
+     pa_hashmap_put(u->devices, d->path, d);
+-- 
+1.7.1
+
