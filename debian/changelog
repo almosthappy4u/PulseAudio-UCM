@@ -1,3 +1,10 @@
+pulseaudio (1:0.9.22~0.9.21+stable-queue-32-g8478-0ubuntu21.2+ti1) maverick; urgency=low
+
+  * pulseaudio-0.9.22~0.9.21+stable-queue-32-g8478+ti1
+    -Add UCM patches
+
+ -- Alejandro Gonzalez <x0092071@ti.com>  Wed, 04 May 2011 14:11:28 -0500
+
 pulseaudio (1:0.9.22~0.9.21+stable-queue-32-g8478-0ubuntu21.1) maverick-proposed; urgency=low
 
   * 0195-SSE-MMX-ARM-Fix-high-frequency-noise-with-unusual-nu.patch:
